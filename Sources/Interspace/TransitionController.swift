@@ -1,0 +1,1150 @@
+import AppKit
+import QuartzCore
+import CDockSwipe
+import os
+
+private let log = Logger(subsystem: "com.cnrad.interspace", category: "spaces")
+
+/// Connects the gesture to the overlay and to the real space switch.
+///
+/// `progress` is measured from the space the Dock will show when everything settles:
+/// 0 is that space, +1 the space to its right, -1 the space to its left.
+/// When a swipe commits, the real switch is posted at once below the overlay,
+/// the base moves to the new space, and the spring always runs to 0.
+///
+/// A press of the keyboard shortcut is a swipe that commits at once. A press during a transition moves
+/// the base again and keeps the position and the speed of the picture, so the picture turns around from
+/// where it is. The Dock gets one switch at a time: see `pumpDock`.
+final class TransitionController {
+    private enum Phase {
+        case idle
+        /// Fingers control `progress`.
+        case dragging
+        /// The spring runs to 0.
+        case settling
+        /// At rest on a snapshot, waiting for the live desktop below to be ready.
+        case holding
+        /// Fade from the snapshot to the live desktop.
+        case revealing
+        /// Visiting every space behind a frozen image of the screen, to capture it.
+        case touring
+    }
+
+    /// Set to false to make every gesture callback do nothing.
+    var isEnabled = false {
+        didSet {
+            if !isEnabled, oldValue { abort() }
+        }
+    }
+
+    private let overlay = Overlay()
+    private let snapshotter = Snapshotter()
+    private let recognizer = SwipeRecognizer()
+
+    private var phase = Phase.idle
+    private var layout: SpaceLayout?
+    private var baseIndex = 0
+    /// The space the Dock was last sent to. Not `baseIndex` while a switch still waits for the Dock.
+    private var dockIndex = 0
+    /// When the last switch was posted in this transition. 0: none yet.
+    private var dockPostTime: CFTimeInterval = 0
+    /// The release that waits for the snapshot is a press of the keyboard shortcut.
+    private var keyPending = false
+    private var progress: CGFloat = 0
+    private var velocity: CGFloat = 0
+    private var dragOrigin: CGFloat = 0
+
+    // Snapshot of the current space for the gesture in progress.
+    private var captureToken = 0
+    private var captureStarted: CFTimeInterval = 0
+    private var captureFinished = false
+    private var captureFailed = false
+    /// A release that arrived before the snapshot.
+    private var pendingRelease: (target: Int, velocity: CGFloat)?
+
+    /// The image of the current space has no Dock in it, so the overlay goes below the real Dock.
+    /// It comes from the capture and not from the setting: the capture can fail to leave the Dock out.
+    private var overlayIsBelowDock = false
+
+    private var cache: [UInt64: Snapshot] = [:]
+    private var cacheOrder: [UInt64] = []
+    private var wallpapers: [CGDirectDisplayID: Snapshot] = [:]
+    /// Counts the changes of the displays, so a picture made for the displays before a change is not kept.
+    private var wallpaperGeneration = 0
+    private var knownSpaces: [String: [UInt64]] = [:]
+
+    /// Development only: makes the next check of the overlay window fail, to test its replacement.
+    enum WindowFault { case none, whenShown, atSwitch }
+    var debugWindowFault = WindowFault.none
+
+    private var link: CADisplayLink?
+    private var lastTick: CFTimeInterval = 0
+    private var phaseStart: CFTimeInterval = 0
+    private var lastFrameTime: CFTimeInterval = 0
+    private var watchdog: Timer?
+
+    /// The Dock reports intermediate state for a moment after a synthetic swipe, so our own
+    /// count is the truth during that time. A swipe past the last space can wedge the Dock.
+    private var lastSwitch: (displayUUID: String, spaceIDs: [UInt64], index: Int, time: CFTimeInterval)?
+    private var didSwitch = false
+
+    // The wait for a stable live desktop before the fade.
+    private var stabilityToken = 0
+    private var stabilityStarted = false
+    /// The live desktop below shows the new space and has stopped changing.
+    private var liveReady = false
+    /// The overlay is removed in one step at the end, with no fade. See `Overlay.canFadeOut`.
+    private var revealIsCut = false
+    private var lastSample: [UInt8]?
+    private var refreshToken = 0
+
+    // Timing of the snap, for the log.
+    private var settleStart: CFTimeInterval = 0
+    private var settleFrames = 0
+    private var linkStartCount = 0
+    /// Milliseconds from the release until the Dock showed the new space. -1 while not known.
+    private var dockLandedAfter = -1
+    private var settleFrom: CGFloat = 0
+
+    /// Space indexes still to visit, in order. The last one is the space the visit started on.
+    /// A swipe in the Instant transition is in progress, and it has already switched (or cannot).
+    private var instantSwipeActive = false
+    private var instantSwipeFired = false
+
+    private var tourRoute: [Int] = []
+    private var tourToken = 0
+    /// The kind of image this visit makes: with the Dock in it, or without.
+    private var tourIncludesDock = true
+    /// A small copy of the desktop the visit started on. The cover goes away only when the live desktop
+    /// looks like this again.
+    private var tourOriginSample: [UInt8]?
+
+    init() {
+        recognizer.onArm = { [weak self] in self?.arm() }
+        recognizer.onBegin = { [weak self] in self?.begin() }
+        recognizer.onChange = { [weak self] dx in self?.change(dx) }
+        recognizer.onEnd = { [weak self] velocity, cancelled in self?.end(velocity: velocity, cancelled: cancelled) }
+    }
+
+    func handle(_ frame: TouchFrame) {
+        guard isEnabled, phase != .touring else { return }
+        recognizer.handle(frame)
+    }
+
+    func prewarm() {
+        snapshotter.refreshDisplays { [weak self] in
+            // The first capture after launch is slower than the ones after it. Take it now and throw it
+            // away, so the first swipe does not pay for it. A swipe that starts during it shares its result.
+            guard let self, self.phase == .idle, let screen = NSScreen.main else { return }
+            self.snapshotter.capture(screen: screen, includeDock: AppSettings.shared.dockMovesWithSpace) { _ in }
+        }
+        prepareWallpapers()
+    }
+
+    func displaysChanged() {
+        wallpapers.removeAll()
+        wallpaperGeneration += 1
+        if phase == .idle {
+            cache.removeAll()
+            cacheOrder.removeAll()
+        }
+        snapshotter.refreshDisplays()
+        prepareWallpapers()
+    }
+
+    /// Makes the desktop picture of each display now, off the main thread. A swipe to a space with no
+    /// image shows that picture, and making it in the swipe stops the main thread for more than 0.1 s.
+    private func prepareWallpapers() {
+        let generation = wallpaperGeneration
+        for screen in NSScreen.screens {
+            let displayID = screen.displayID
+            guard wallpapers[displayID] == nil else { continue }
+            snapshotter.wallpaper(for: screen) { [weak self] snapshot in
+                // The displays changed during the work, or a swipe already made the picture itself.
+                guard let self, generation == self.wallpaperGeneration, self.wallpapers[displayID] == nil else { return }
+                self.wallpapers[displayID] = snapshot
+            }
+        }
+    }
+
+    // MARK: - Gesture
+
+    private var isInstant: Bool {
+        AppSettings.shared.transition == .instant
+    }
+
+    private func arm() {
+        // Instant draws nothing, so it needs no image.
+        guard Config.captureOnTouchDown, !isInstant, phase == .idle, !overlay.isVisible else { return }
+        prepare()
+    }
+
+    private func begin() {
+        if isInstant, phase == .idle, !overlay.isVisible {
+            // Only the list of spaces is needed, to know if there is a space in that direction.
+            layout = currentLayout()
+            setBase(layout?.currentIndex ?? 0)
+            instantSwipeActive = layout != nil
+            instantSwipeFired = false
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        lastFrameTime = now
+        startWatchdog()
+
+        if overlay.isVisible {
+            // Catch the transition in flight and continue from where it is.
+            log.notice("begin: caught the overlay in phase \(String(describing: self.phase), privacy: .public) at progress \(self.progress)")
+            stopLink()
+            stabilityToken += 1
+            stabilityStarted = false
+            liveReady = false
+            overlay.alpha = 1
+            pendingRelease = nil
+            keyPending = false
+            dragOrigin = progress
+            velocity = 0
+            phase = .dragging
+            return
+        }
+
+        if layout == nil || now - captureStarted > Config.snapshotMaxAge {
+            prepare()
+        }
+        guard layout != nil else {
+            // No space information: leave the gesture alone.
+            stopWatchdog()
+            recognizer.reset()
+            return
+        }
+
+        progress = 0
+        velocity = 0
+        dragOrigin = 0
+        didSwitch = false
+        pendingRelease = nil
+        keyPending = false
+        phase = .dragging
+        if captureFinished, !captureFailed {
+            present()
+        }
+    }
+
+    // MARK: - Keyboard
+
+    /// A press of the shortcut for the space to the left (-1) or to the right (+1).
+    func keyboardStep(_ direction: Int) {
+        guard isEnabled, direction != 0 else { return }
+
+        if isInstant {
+            guard phase == .idle, !overlay.isVisible, !instantSwipeActive, let layout = currentLayout() else { return }
+            self.layout = layout
+            setBase(layout.currentIndex)
+            _ = postSwitch(direction)
+            self.layout = nil
+            return
+        }
+
+        switch phase {
+        case .touring:
+            return
+
+        case .dragging:
+            // Fingers have the transition. Only a press that still waits for its snapshot takes one more.
+            guard keyPending, let release = pendingRelease, let layout,
+                  layout.spaceIDs.indices.contains(baseIndex + release.target + direction)
+            else { return }
+            pendingRelease = (release.target + direction, 0)
+
+        case .idle:
+            guard !overlay.isVisible else { return }
+            if layout == nil || CACurrentMediaTime() - captureStarted > Config.snapshotMaxAge {
+                prepare()
+            }
+            guard let layout, layout.spaceIDs.indices.contains(baseIndex + direction) else {
+                // No space in that direction, or no space information.
+                captureToken += 1
+                reset()
+                return
+            }
+            log.notice("key: start, direction \(direction)")
+            progress = 0
+            velocity = 0
+            dragOrigin = 0
+            didSwitch = false
+            phase = .dragging
+            keyPending = true
+            pendingRelease = (direction, 0)
+            if captureFinished {
+                captureDidFinish()
+            } else {
+                switchWithoutOverlayIfLate()
+            }
+
+        case .settling, .holding, .revealing:
+            guard let layout, layout.spaceIDs.indices.contains(baseIndex + direction) else { return }
+            // Catch the transition in flight. The picture stays where it is and keeps its speed:
+            // only the place where it comes to rest changes.
+            log.notice("key: direction \(direction) in phase \(String(describing: self.phase), privacy: .public) at progress \(self.progress) velocity \(self.velocity)")
+            overlay.alpha = 1
+            commit(target: direction, velocity: velocity)
+        }
+    }
+
+    /// A release can come before the snapshot. When the snapshot takes too long, switch with no transition.
+    private func switchWithoutOverlayIfLate() {
+        let token = captureToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self, self.captureToken == token, let release = self.pendingRelease else { return }
+            self.pendingRelease = nil
+            self.captureToken += 1
+            self.switchWithoutOverlay(release.target)
+        }
+    }
+
+    private func change(_ dx: CGFloat) {
+        if instantSwipeActive {
+            // The first movement with a direction switches the space, at once and one time.
+            // The rest of the swipe does nothing, so it cannot be taken back.
+            let direction = Self.progress(forFingerTravel: dx)
+            if !instantSwipeFired, direction != 0 {
+                instantSwipeFired = true
+                _ = postSwitch(direction > 0 ? 1 : -1)
+            }
+            return
+        }
+        guard phase == .dragging, pendingRelease == nil else { return }
+        lastFrameTime = CACurrentMediaTime()
+        var raw = dragOrigin + Self.progress(forFingerTravel: dx)
+
+        // With a high sensitivity one drag can pass several spaces. Each time the fingers have crossed a
+        // whole space, that space becomes the one the transition is measured from, and the Dock is sent
+        // there below the overlay. The drag then goes on to the next space, or back again.
+        let crossed = Int(raw.rounded(.towardZero))
+        if crossed != 0, overlay.isVisible {
+            let before = baseIndex
+            progress = raw
+            retarget(by: crossed)
+            let moved = CGFloat(baseIndex - before)
+            dragOrigin -= moved
+            raw -= moved
+        }
+        // The Dock takes one step at a time. Keep it going while the fingers are still down.
+        pumpDock()
+
+        progress = constrain(raw)
+        if overlay.isVisible {
+            overlay.render(progress: progress)
+        }
+    }
+
+    private func end(velocity fingerVelocity: CGFloat, cancelled: Bool) {
+        if instantSwipeActive {
+            instantSwipeActive = false
+            if phase == .idle {
+                layout = nil
+            }
+            return
+        }
+        guard phase == .dragging, pendingRelease == nil else { return }
+        stopWatchdog()
+
+        let releaseVelocity = Self.progress(forFingerTravel: fingerVelocity)
+        let target = cancelled ? 0 : self.target(for: progress, velocity: releaseVelocity)
+        log.notice("end: progress \(self.progress) velocity \(releaseVelocity) target \(target) overlay \(self.overlay.isVisible) captureFinished \(self.captureFinished) captureFailed \(self.captureFailed)")
+
+        if overlay.isVisible {
+            commit(target: target, velocity: releaseVelocity)
+        } else if target == 0 {
+            // Nothing was shown and nothing changes.
+            reset()
+        } else if captureFinished {
+            // The snapshot failed. Switch with no transition instead of doing nothing.
+            switchWithoutOverlay(target)
+        } else {
+            // A very fast flick can end before the snapshot arrives. Run the animation when it does.
+            pendingRelease = (target, releaseVelocity)
+            switchWithoutOverlayIfLate()
+        }
+    }
+
+    private func target(for progress: CGFloat, velocity: CGFloat) -> Int {
+        var target = 0
+        if progress > Config.commitThreshold, hasNext {
+            target = 1
+        } else if progress < -Config.commitThreshold, hasPrevious {
+            target = -1
+        }
+
+        if velocity > Config.flickVelocity {
+            if target == -1 {
+                target = 0
+            } else if progress > Config.flickMinProgress, hasNext {
+                target = 1
+            }
+        } else if velocity < -Config.flickVelocity {
+            if target == 1 {
+                target = 0
+            } else if progress < -Config.flickMinProgress, hasPrevious {
+                target = -1
+            }
+        }
+        return target
+    }
+
+    private func commit(target: Int, velocity releaseVelocity: CGFloat) {
+        if target != 0 {
+            retarget(by: target)
+        }
+        velocity = min(max(releaseVelocity, -TransitionMath.maxReleaseVelocity), TransitionMath.maxReleaseVelocity)
+        stabilityToken += 1
+        stabilityStarted = false
+        liveReady = false
+        phase = .settling
+        settleStart = CACurrentMediaTime()
+        settleFrames = 0
+        dockLandedAfter = -1
+        settleFrom = progress
+        startLink()
+    }
+
+    private func switchWithoutOverlay(_ target: Int) {
+        log.notice("switch with no overlay, target \(target)")
+        if target != 0 {
+            _ = postSwitch(target.signum())
+        }
+        reset()
+    }
+
+    /// Sets the space the transition is measured from, when the Dock is at rest on that space.
+    private func setBase(_ index: Int) {
+        baseIndex = index
+        dockIndex = index
+        dockPostTime = 0
+    }
+
+    private var limit: CGFloat { CGFloat(Overlay.reach) }
+
+    /// Moves the place where the transition comes to rest by a number of spaces. The picture does not move.
+    private func retarget(by requested: Int) {
+        guard let layout else { return }
+        let destination = min(max(baseIndex + requested, 0), layout.spaceIDs.count - 1)
+        let steps = destination - baseIndex
+        guard steps != 0 else { return }
+        baseIndex = destination
+        // There is a picture for `limit` spaces to each side. More than that is rare, and the picture jumps.
+        progress = min(max(progress - CGFloat(steps), -limit), limit)
+        didSwitch = true
+        pumpDock()
+        // The screens get new images and new positions. Both must reach the display in the
+        // same frame: new images in the old positions show the wrong desktop for one frame.
+        CATransaction.begin()
+        assignCards()
+        overlay.render(progress: progress)
+        CATransaction.commit()
+    }
+
+    /// Sends the Dock one space closer to `baseIndex`, when it has finished the step before.
+    ///
+    /// The picture is free of the Dock: it turns around at once. The Dock is not: a swipe that is posted
+    /// while the Dock is busy with another one can be lost. So the Dock gets one at a time, below the overlay.
+    private func pumpDock() {
+        guard layout != nil, dockIndex != baseIndex else { return }
+        let now = CACurrentMediaTime()
+        if dockPostTime > 0, !dockIsOn(dockIndex) {
+            guard now - dockPostTime > 1.0 else { return }
+            log.error("the Dock did not reach index \(self.dockIndex)")
+            followDock(readDock: true)
+            return
+        }
+        if !postSwitch(baseIndex > dockIndex ? 1 : -1) {
+            followDock(readDock: false)
+        }
+    }
+
+    /// The Dock cannot go where the picture goes. Makes the picture go where the Dock is.
+    private func followDock(readDock: Bool) {
+        guard let layout else { return }
+        var actual = dockIndex
+        if readDock, let live = Spaces.layout(for: layout.screen), live.spaceIDs == layout.spaceIDs {
+            actual = live.currentIndex
+        }
+        let moved = baseIndex - actual
+        setBase(actual)
+        guard moved != 0 else { return }
+        progress = min(max(progress + CGFloat(moved), -limit), limit)
+        if overlay.isVisible {
+            CATransaction.begin()
+            assignCards()
+            overlay.render(progress: progress)
+            CATransaction.commit()
+        }
+        if phase == .holding || phase == .revealing {
+            // The picture is not at rest now.
+            stabilityToken += 1
+            stabilityStarted = false
+            liveReady = false
+            overlay.alpha = 1
+            phase = .settling
+        }
+    }
+
+    /// Makes the Dock switch one space now, from the space it was last sent to, with no animation of its own.
+    private func postSwitch(_ target: Int) -> Bool {
+        guard let layout, layout.spaceIDs.indices.contains(dockIndex + target) else { return false }
+        // A swipe past the last space can wedge the Dock. If a desktop was added or removed since this
+        // gesture read the list, our index is not safe: do not switch.
+        guard let live = Spaces.layout(for: layout.screen), live.spaceIDs == layout.spaceIDs else {
+            log.notice("the list of spaces changed during a gesture, no switch")
+            return false
+        }
+        var required = layout.desktopIDs
+        if debugWindowFault == .atSwitch {
+            debugWindowFault = .none
+            required.append(.max)
+        }
+        if overlay.ensureOnAllDesktops(required) {
+            log.notice("replaced the overlay window at the switch: it was not on every desktop")
+        }
+        guard ds_post_switch(target > 0 ? DSDirectionRight : DSDirectionLeft) else { return false }
+        dockIndex += target
+        dockPostTime = CACurrentMediaTime()
+        lastSwitch = (layout.displayUUID, layout.spaceIDs, dockIndex, dockPostTime)
+        return true
+    }
+
+    // MARK: - Snapshot
+
+    /// Reads the space list and starts the snapshot of the current space.
+    private func prepare() {
+        refreshToken += 1
+        captureToken += 1
+        captureFinished = false
+        captureFailed = false
+        layout = currentLayout()
+        guard let layout else { return }
+        setBase(layout.currentIndex)
+        captureStarted = CACurrentMediaTime()
+
+        let token = captureToken
+        let spaceID = layout.spaceIDs[baseIndex]
+        snapshotter.capture(screen: layout.screen, includeDock: AppSettings.shared.dockMovesWithSpace) { [weak self] snapshot in
+            guard let self, token == self.captureToken else { return }
+            if let snapshot {
+                self.overlayIsBelowDock = !snapshot.includesDock
+                self.store(snapshot, for: spaceID)
+            }
+            self.captureFinished = true
+            self.captureFailed = snapshot == nil
+            self.captureDidFinish()
+        }
+    }
+
+    private func captureDidFinish() {
+        guard phase == .dragging, !overlay.isVisible else { return }
+        if !captureFailed {
+            present()
+        }
+        guard let release = pendingRelease else { return }
+        pendingRelease = nil
+        if overlay.isVisible {
+            commit(target: release.target, velocity: release.velocity)
+        } else {
+            switchWithoutOverlay(release.target)
+        }
+    }
+
+    private func currentLayout() -> SpaceLayout? {
+        guard let screen = NSScreen.underCursor, var layout = Spaces.layout(for: screen) else { return nil }
+        if let lastSwitch,
+           lastSwitch.displayUUID == layout.displayUUID,
+           lastSwitch.spaceIDs == layout.spaceIDs,
+           CACurrentMediaTime() - lastSwitch.time < 1.0,
+           layout.spaceIDs.indices.contains(lastSwitch.index) {
+            layout.currentIndex = lastSwitch.index
+        }
+        forgetRemovedSpaces(layout)
+        return layout
+    }
+
+    /// Drops the images of spaces that are gone, so a removed desktop does not keep its memory.
+    private func forgetRemovedSpaces(_ layout: SpaceLayout) {
+        defer { knownSpaces[layout.displayUUID] = layout.spaceIDs }
+        guard let before = knownSpaces[layout.displayUUID], before != layout.spaceIDs else { return }
+        let removed = Set(before).subtracting(layout.spaceIDs)
+        for spaceID in removed {
+            cache[spaceID] = nil
+        }
+        cacheOrder.removeAll { removed.contains($0) }
+        log.notice("spaces changed: \(before.count) to \(layout.spaceIDs.count), \(removed.count) removed")
+    }
+
+    private func store(_ snapshot: Snapshot, for spaceID: UInt64) {
+        cache[spaceID] = snapshot
+        cacheOrder.removeAll { $0 == spaceID }
+        cacheOrder.append(spaceID)
+        while cacheOrder.count > Config.snapshotCacheLimit {
+            cache[cacheOrder.removeFirst()] = nil
+        }
+    }
+
+    private func content(at index: Int) -> CardContent {
+        guard let layout, layout.spaceIDs.indices.contains(index) else { return .none }
+        if let snapshot = cache[layout.spaceIDs[index]] {
+            return .snapshot(snapshot)
+        }
+        let displayID = layout.displayID
+        if wallpapers[displayID] == nil {
+            // Only when `prepareWallpapers` has not finished yet. This one stops the main thread.
+            wallpapers[displayID] = snapshotter.wallpaper(for: layout.screen)
+        }
+        return wallpapers[displayID].map { .snapshot($0) } ?? .placeholder
+    }
+
+    // MARK: - Overlay
+
+    private func present() {
+        guard let layout else { return }
+        var required = layout.desktopIDs
+        if debugWindowFault == .whenShown {
+            debugWindowFault = .none
+            required.append(.max)
+        }
+        if overlay.ensureOnAllDesktops(required) {
+            log.notice("replaced the overlay window before it was shown: it was not on every desktop")
+        }
+        overlay.isBelowDock = overlayIsBelowDock
+        overlay.style = AppSettings.shared.transition
+        overlay.roundsCorners = AppSettings.shared.roundedCorners
+        CATransaction.begin()
+        overlay.attach(to: layout.screen)
+        assignCards()
+        overlay.render(progress: progress)
+        CATransaction.commit()
+        overlay.present()
+    }
+
+    private func assignCards() {
+        overlay.setCards { offset in self.content(at: self.baseIndex + offset) }
+    }
+
+    private var hasNext: Bool {
+        guard let layout else { return false }
+        return baseIndex + 1 < layout.spaceIDs.count
+    }
+
+    private var hasPrevious: Bool {
+        layout != nil && baseIndex > 0
+    }
+
+    private func constrain(_ raw: CGFloat) -> CGFloat {
+        if raw > 0, !hasNext { return Self.rubberBand(raw) }
+        if raw < 0, !hasPrevious { return -Self.rubberBand(-raw) }
+        // One space, or as far as the picture already was when the fingers caught it.
+        let limit = max(1, abs(dragOrigin))
+        return min(max(raw, -limit), limit)
+    }
+
+    private static func rubberBand(_ distance: CGFloat) -> CGFloat {
+        let limit = Config.edgeRubberBand
+        return (1 - 1 / (distance * 0.55 / limit + 1)) * limit
+    }
+
+    /// Content follows the fingers: with natural scrolling, fingers that move left bring in the space on the right.
+    private static func progress(forFingerTravel dx: CGFloat) -> CGFloat {
+        let natural = (UserDefaults.standard.object(forKey: "com.apple.swipescrolldirection") as? Bool) ?? true
+        return (natural ? -dx : dx) * Config.travelPerTrackpadWidth * CGFloat(AppSettings.shared.sensitivity)
+    }
+
+    // MARK: - Animation
+
+    private func startLink() {
+        guard link == nil, let screen = layout?.screen ?? NSScreen.main else { return }
+        let link = screen.displayLink(target: self, selector: #selector(tick(_:)))
+        linkStartCount += 1
+        link.add(to: .main, forMode: .common)
+        self.link = link
+        lastTick = 0
+    }
+
+    private func stopLink() {
+        link?.invalidate()
+        link = nil
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        let now = link.timestamp
+        let delta = lastTick == 0 ? link.duration : min(now - lastTick, 1.0 / 30)
+        lastTick = now
+
+        if phase == .settling || phase == .holding || phase == .revealing {
+            pumpDock()
+        }
+
+        switch phase {
+        case .settling:
+            stepSpring(CGFloat(delta))
+            settleFrames += 1
+            overlay.render(progress: progress)
+            if didSwitch, dockLandedAfter < 0, dockHasLanded {
+                dockLandedAfter = Int((CACurrentMediaTime() - settleStart) * 1000)
+            }
+            startLiveCheckIfNeeded()
+            if abs(progress) < Config.revealStartDistance {
+                // Close enough: the last points of travel finish below the fade.
+                if liveReady {
+                    startReveal()
+                } else if isSettled {
+                    progress = 0
+                    velocity = 0
+                    overlay.render(progress: 0)
+                    phase = .holding
+                    phaseStart = now
+                }
+            }
+
+        case .holding:
+            startLiveCheckIfNeeded(force: now - phaseStart > 0.5)
+            if liveReady {
+                startReveal()
+            }
+
+        case .revealing:
+            if !isSettled {
+                stepSpring(CGFloat(delta))
+                overlay.render(progress: isSettled ? 0 : progress)
+            }
+            if revealIsCut {
+                // No fade to hide the last points of travel: wait until the picture is exactly in place.
+                if isSettled {
+                    reset()
+                }
+            } else {
+                let alpha = 1 - CGFloat(now - phaseStart) / Config.revealDuration
+                if alpha <= 0 {
+                    reset()
+                } else {
+                    overlay.alpha = alpha
+                }
+            }
+
+        case .idle, .dragging, .touring:
+            break
+        }
+    }
+
+    private var isSettled: Bool {
+        TransitionMath.isSettled(progress: progress, velocity: velocity)
+    }
+
+    /// Starts to look at the live desktop below the overlay near the end of the snap.
+    /// It starts only when the Dock shows the new space: before that, the old space would look "ready".
+    private func startLiveCheckIfNeeded(force: Bool = false) {
+        guard !liveReady, !stabilityStarted else { return }
+        guard didSwitch else {
+            // Nothing changed below, the live desktop is what the snapshot shows.
+            liveReady = true
+            return
+        }
+        // The Dock still has a switch to do.
+        guard dockIndex == baseIndex else { return }
+        guard force || (abs(progress) < Config.liveCheckStartDistance && dockHasLanded) else { return }
+        stabilityStarted = true
+        lastSample = nil
+        stabilityToken += 1
+        sampleLiveDesktop(stabilityToken, deadline: CACurrentMediaTime() + Config.revealMaxWait)
+    }
+
+    private func startReveal() {
+        let milliseconds = Int((CACurrentMediaTime() - settleStart) * 1000)
+        log.notice("\(self.overlay.canFadeOut ? "fade" : "cut", privacy: .public) starts \(milliseconds) ms after release, from \(self.settleFrom); Dock showed the new space after \(self.dockLandedAfter) ms")
+        stabilityToken += 1
+        stabilityStarted = false
+        lastSample = nil
+        revealIsCut = !overlay.canFadeOut
+        phase = .revealing
+        phaseStart = CACurrentMediaTime()
+    }
+
+    /// Looks at the desktop below the overlay until two looks in a row are the same.
+    private func sampleLiveDesktop(_ token: Int, deadline: CFTimeInterval) {
+        guard let layout else {
+            liveReady = true
+            return
+        }
+        snapshotter.sampleBelow(windowNumber: overlay.windowNumber, screen: layout.screen) { [weak self] sample in
+            // A new swipe that catches the overlay ends this check.
+            guard let self, token == self.stabilityToken, self.phase == .settling || self.phase == .holding else { return }
+            guard let sample else {
+                self.liveReady = true
+                return
+            }
+            if let origin = self.tourOriginSample {
+                // After a visit of all spaces: not "has it stopped changing" but "is it the desktop we
+                // started on". A desktop that was visited can look still and be the wrong one.
+                if Snapshotter.samplesMatch(origin, sample, sameDesktop: true) {
+                    self.liveReady = true
+                    return
+                }
+            } else if let previous = self.lastSample, Snapshotter.samplesMatch(previous, sample) {
+                self.liveReady = true
+                return
+            }
+            if CACurrentMediaTime() > deadline {
+                log.info("live desktop still changing, fading anyway")
+                self.liveReady = true
+            } else {
+                self.lastSample = sample
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+                    guard let self, token == self.stabilityToken else { return }
+                    self.sampleLiveDesktop(token, deadline: deadline)
+                }
+            }
+        }
+    }
+
+    private func stepSpring(_ delta: CGFloat) {
+        TransitionMath.stepSpring(
+            progress: &progress, velocity: &velocity, delta: delta, speed: CGFloat(AppSettings.shared.speed),
+            limit: limit
+        )
+    }
+
+    private var dockHasLanded: Bool {
+        dockIsOn(baseIndex)
+    }
+
+    /// True when the Dock shows the space at `index`. Also true when that cannot be known.
+    private func dockIsOn(_ index: Int) -> Bool {
+        guard let layout, layout.spaceIDs.indices.contains(index),
+              let live = Spaces.layout(for: layout.screen)
+        else { return true }
+        return live.spaceIDs.indices.contains(live.currentIndex)
+            && live.spaceIDs[live.currentIndex] == layout.spaceIDs[index]
+    }
+
+    // MARK: - Capture of every space
+
+    /// macOS draws only the active space, so a space can be captured only while it is active.
+    /// This shows a frozen image of the screen, switches through the spaces we have no image of below it,
+    /// captures each one, and comes back. It takes about a second.
+    /// `again` also replaces the images we already have.
+    func captureAllSpaces(again: Bool = false) {
+        guard isEnabled, AppSettings.shared.transition.isDrawn, phase == .idle, !overlay.isVisible,
+              let layout = currentLayout(), layout.spaceIDs.count > 1
+        else { return }
+
+        if again {
+            cache.removeAll()
+            cacheOrder.removeAll()
+        }
+        let origin = layout.currentIndex
+        let includeDock = AppSettings.shared.dockMovesWithSpace
+        // An image of the other kind (with the Dock, or without it) is as good as no image.
+        let unknown = layout.spaceIDs.indices.filter {
+            $0 != origin && cache[layout.spaceIDs[$0]]?.includesDock != includeDock
+        }
+        guard let lowest = unknown.min(), let highest = unknown.max() else { return }
+
+        // Go to the nearer end first, then to the other end, then back.
+        let low = min(lowest, origin)
+        let high = max(highest, origin)
+        let stops = origin - low <= high - origin ? [low, high, origin] : [high, low, origin]
+        var route: [Int] = []
+        var position = origin
+        for stop in stops {
+            while position != stop {
+                position += stop > position ? 1 : -1
+                route.append(position)
+            }
+        }
+
+        log.notice("visit start: \(layout.spaceIDs.count) spaces, on index \(origin), route \(route, privacy: .public)")
+        recognizer.reset()
+        captureToken += 1
+        tourToken += 1
+        let token = tourToken
+        self.layout = layout
+        setBase(origin)
+        tourRoute = route
+        progress = 0
+        velocity = 0
+        phase = .touring
+
+        // The overlay covers the screen, so nothing may leave it there.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3 + 0.8 * Double(route.count)) { [weak self] in
+            guard let self, self.isTouring(token) else { return }
+            self.reset()
+        }
+
+        tourIncludesDock = includeDock
+        tourOriginSample = nil
+
+        /// Shows the cover, then starts the visit.
+        func begin(cover: Snapshot) {
+            presentCover(cover)
+            // The captures below need to know the overlay window, which is on screen only now.
+            snapshotter.refreshDisplays { [weak self] in
+                guard let self, self.isTouring(token) else { return }
+                // What the desktop below the cover looks like before the first switch.
+                self.snapshotter.sampleBelow(windowNumber: self.overlay.windowNumber, screen: layout.screen) { [weak self] sample in
+                    guard let self, self.isTouring(token) else { return }
+                    self.tourOriginSample = sample
+                    self.visitNextSpace(token)
+                }
+            }
+        }
+
+        snapshotter.capture(screen: layout.screen, includeDock: includeDock) { [weak self] snapshot in
+            guard let self, self.isTouring(token) else { return }
+            guard let snapshot else {
+                self.reset()
+                return
+            }
+            self.store(snapshot, for: layout.spaceIDs[origin])
+            if snapshot.includesDock {
+                begin(cover: snapshot)
+                return
+            }
+            // The image for the transition has no Dock and no menu bar. The cover must have them, because it
+            // is above everything: take one more image, of the whole screen.
+            self.snapshotter.capture(screen: layout.screen, includeDock: true) { [weak self] full in
+                guard let self, self.isTouring(token) else { return }
+                guard let full else {
+                    self.reset()
+                    return
+                }
+                begin(cover: full)
+            }
+        }
+    }
+
+    /// Shows a frozen image of the whole screen above everything, the Dock and the menu bar too.
+    ///
+    /// The Dock draws a space switch in its own layer, below the real Dock and above normal windows.
+    /// An overlay just below the Dock can be under that layer for one frame, and the space that is being
+    /// visited then shows through. Above everything, nothing can be on top of the cover.
+    private func presentCover(_ cover: Snapshot) {
+        guard let layout else { return }
+        overlay.ensureOnAllDesktops(layout.desktopIDs)
+        overlay.isBelowDock = false
+        overlay.style = .lightweight
+        overlay.roundsCorners = AppSettings.shared.roundedCorners
+        CATransaction.begin()
+        overlay.attach(to: layout.screen)
+        overlay.setCards { offset in offset == 0 ? .snapshot(cover) : .none }
+        overlay.render(progress: 0)
+        CATransaction.commit()
+        overlay.present()
+    }
+
+    /// Development only: shows the cover for `hold` seconds with no space switch below it, then fades it out.
+    func debugCoverTest(hold: Double) {
+        guard isEnabled, phase == .idle, !overlay.isVisible, let layout = currentLayout() else { return }
+        self.layout = layout
+        setBase(layout.currentIndex)
+        progress = 0
+        velocity = 0
+        phase = .touring
+        tourToken += 1
+        let token = tourToken
+        snapshotter.capture(screen: layout.screen, includeDock: true) { [weak self] snapshot in
+            guard let self, self.isTouring(token), let snapshot else { return }
+            self.presentCover(snapshot)
+            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
+                guard let self, self.isTouring(token) else { return }
+                self.tourToken += 1
+                self.didSwitch = false
+                self.stabilityStarted = false
+                self.liveReady = false
+                self.settleStart = CACurrentMediaTime()
+                self.phase = .holding
+                self.phaseStart = CACurrentMediaTime()
+                self.startLink()
+            }
+        }
+    }
+
+    private func isTouring(_ token: Int) -> Bool {
+        phase == .touring && token == tourToken
+    }
+
+    private func visitNextSpace(_ token: Int) {
+        guard let layout, !tourRoute.isEmpty else {
+            finishTour()
+            return
+        }
+        let index = tourRoute.removeFirst()
+        guard postSwitch(index > baseIndex ? 1 : -1) else {
+            finishTour()
+            return
+        }
+        // `postSwitch` moved `dockIndex` to the same space.
+        baseIndex = index
+        let spaceID = layout.spaceIDs[index]
+        let includesDock = tourIncludesDock
+        let needsCapture = cache[spaceID]?.includesDock != includesDock
+
+        // Never post the next swipe before the Dock has finished this one.
+        waitForDock(token, deadline: CACurrentMediaTime() + 1.0) { [weak self] in
+            guard let self else { return }
+            guard needsCapture else {
+                // Only on the way to another space. The Dock has finished this switch, and that is all
+                // the next one needs: a swipe posts its next switch on the same condition (`pumpDock`).
+                self.visitNextSpace(token)
+                return
+            }
+            // The space gets time to draw itself before the capture.
+            DispatchQueue.main.asyncAfter(deadline: .now() + Config.visitSettleTime) { [weak self] in
+                guard let self, self.isTouring(token) else { return }
+                let finish: (Snapshot?) -> Void = { [weak self] snapshot in
+                    guard let self, self.isTouring(token) else { return }
+                    log.notice("visit: index \(index) captured \(snapshot != nil), with the Dock \(includesDock)")
+                    if let snapshot {
+                        self.store(snapshot, for: spaceID)
+                    }
+                    self.visitNextSpace(token)
+                }
+                if includesDock {
+                    // Everything below the cover.
+                    self.snapshotter.captureBelow(windowNumber: self.overlay.windowNumber, screen: layout.screen, completion: finish)
+                } else {
+                    // Everything below the Dock. The cover is above the Dock, so it is not in the image.
+                    self.snapshotter.captureBelowDock(screen: layout.screen, completion: finish)
+                }
+            }
+        }
+    }
+
+    private func waitForDock(_ token: Int, deadline: CFTimeInterval, then: @escaping () -> Void) {
+        guard isTouring(token) else { return }
+        if dockHasLanded {
+            then()
+        } else if CACurrentMediaTime() > deadline {
+            // The Dock did not follow. Stop here and show where it really is.
+            log.error("visit: the Dock did not reach index \(self.baseIndex)")
+            finishTour()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                self?.waitForDock(token, deadline: deadline, then: then)
+            }
+        }
+    }
+
+    private func finishTour() {
+        tourRoute.removeAll()
+        tourToken += 1
+        guard let layout, overlay.isVisible else {
+            reset()
+            return
+        }
+        // Show the space the Dock is on, also when the visit stopped early.
+        if let live = Spaces.layout(for: layout.screen), live.spaceIDs == layout.spaceIDs {
+            setBase(live.currentIndex)
+        } else {
+            setBase(baseIndex)
+        }
+        log.notice("visit end: on index \(self.baseIndex), \(self.cache.count) spaces captured")
+        // The cover stays as it is, a picture of the desktop the visit started on.
+        didSwitch = true
+        stabilityStarted = false
+        liveReady = false
+        settleStart = CACurrentMediaTime()
+        settleFrom = 0
+        phase = .holding
+        phaseStart = CACurrentMediaTime()
+        startLink()
+    }
+
+    // MARK: - Reset
+
+    private func reset() {
+        if overlay.isVisible, phase != .revealing {
+            log.notice("reset with the overlay visible in phase \(String(describing: self.phase), privacy: .public)")
+        }
+        stopLink()
+        stopWatchdog()
+        let switched = didSwitch && overlay.isVisible
+        if overlay.isVisible {
+            overlay.hide()
+        }
+        stabilityToken += 1
+        stabilityStarted = false
+        liveReady = false
+        lastSample = nil
+        refreshToken += 1
+        if switched, Config.refreshAfterSwitch, isEnabled {
+            refreshCurrentSpace(refreshToken)
+        }
+        phase = .idle
+        layout = nil
+        progress = 0
+        velocity = 0
+        didSwitch = false
+        pendingRelease = nil
+        keyPending = false
+        dockPostTime = 0
+        captureFinished = false
+        captureFailed = false
+        tourRoute.removeAll()
+        tourToken += 1
+        // Only the end of a visit of all spaces uses this. A swipe must not wait for that desktop.
+        tourOriginSample = nil
+    }
+
+    /// Captures the space we just arrived on, now that the overlay is gone and the desktop is at rest.
+    /// A new swipe cancels it, because a swipe takes its own capture.
+    private func refreshCurrentSpace(_ token: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, token == self.refreshToken, self.phase == .idle, !self.overlay.isVisible,
+                  let layout = self.currentLayout()
+            else { return }
+            let spaceID = layout.spaceIDs[layout.currentIndex]
+            self.snapshotter.capture(screen: layout.screen, includeDock: AppSettings.shared.dockMovesWithSpace) { [weak self] snapshot in
+                guard let self, let snapshot, token == self.refreshToken, !self.overlay.isVisible,
+                      // The image is of this space only if the space did not change during the capture.
+                      let after = Spaces.layout(for: layout.screen),
+                      after.spaceIDs.indices.contains(after.currentIndex),
+                      after.spaceIDs[after.currentIndex] == spaceID
+                else { return }
+                self.store(snapshot, for: spaceID)
+                log.info("refreshed the image of space \(spaceID)")
+            }
+        }
+    }
+
+    /// Stops everything now, for example when the app is disabled in the middle of a swipe.
+    private func abort() {
+        instantSwipeActive = false
+        captureToken += 1
+        recognizer.reset()
+        reset()
+    }
+
+    // The overlay covers the whole screen, so a drag must never stay open if the trackpad stops reporting.
+    private func startWatchdog() {
+        stopWatchdog()
+        var staleChecks = 0
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, self.phase == .dragging, self.pendingRelease == nil else { return }
+            guard CACurrentMediaTime() - self.lastFrameTime > 1.0 else {
+                staleChecks = 0
+                return
+            }
+            // Two checks in a row. If the main thread was busy, touch frames wait in its queue, and this
+            // timer can run before them: one more turn lets them arrive, so a busy moment does not end the drag.
+            staleChecks += 1
+            if staleChecks >= 2 {
+                log.notice("the trackpad stopped reporting during a drag, ending it")
+                self.recognizer.reset()
+                self.end(velocity: 0, cancelled: false)
+            }
+        }
+    }
+
+    private func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+    }
+}

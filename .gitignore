@@ -1,0 +1,28 @@
+# Build output
+.build/
+build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/
+xcuserdata/
+
+# The benchmark tool: its build output, and the numbers and logs of one machine
+perf/.build/
+perf/results/
+perf/REPORT.md
+
+# macOS and editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Agent settings of one person
+.claude/
+
+# Signing material. It is made per machine by scripts/setup-signing.sh and lives outside this folder.
+# These lines are here so a copy can never be committed by accident.
+*.p12
+*.pem
+*.keychain-db
+signing-keychain-password

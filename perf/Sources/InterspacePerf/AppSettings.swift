@@ -1,0 +1,1 @@
+../../../Sources/Interspace/AppSettings.swift

@@ -1,0 +1,30 @@
+#!/bin/bash
+# Builds Interspace and packages it as build/Interspace.app.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+swift build -c release
+
+APP="build/Interspace.app"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS"
+cp "$(swift build -c release --show-bin-path)/Interspace" "$APP/Contents/MacOS/Interspace"
+cp Info.plist "$APP/Contents/Info.plist"
+
+# macOS ties the Accessibility and Screen Recording grants to the signature.
+# With the local identity from scripts/setup-signing.sh the grants stay valid after a rebuild.
+IDENTITY="interspace local signing"
+KEYCHAIN="$HOME/Library/Keychains/interspace-signing.keychain-db"
+SECRET_FILE="$HOME/.config/interspace/signing-keychain-password"
+
+if [ -f "$KEYCHAIN" ] && [ -f "$SECRET_FILE" ]; then
+    security unlock-keychain -p "$(cat "$SECRET_FILE")" "$KEYCHAIN"
+    codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --identifier com.cnrad.interspace "$APP"
+else
+    echo "No local signing identity (run scripts/setup-signing.sh). Using an ad-hoc signature:"
+    echo "each new build must be allowed again in System Settings."
+    codesign --force --sign - --identifier com.cnrad.interspace "$APP"
+fi
+
+echo "Built $APP"

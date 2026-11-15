@@ -20,6 +20,18 @@ KEYCHAIN="$HOME/Library/Keychains/interspace-signing.keychain-db"
 SECRET_FILE="$HOME/.config/interspace/signing-keychain-password"
 
 if [ -f "$KEYCHAIN" ] && [ -f "$SECRET_FILE" ]; then
+    # codesign finds the identity only in a keychain on the search list. Deleting the keychain (as the
+    # uninstall does) takes it off the list, and creating it again does not always put it back.
+    if ! security list-keychains -d user | grep -qF "$KEYCHAIN"; then
+        existing=()
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line#\"}"
+            line="${line%\"}"
+            [ -n "$line" ] && existing+=("$line")
+        done < <(security list-keychains -d user)
+        security list-keychains -d user -s ${existing[@]+"${existing[@]}"} "$KEYCHAIN"
+    fi
     security unlock-keychain -p "$(cat "$SECRET_FILE")" "$KEYCHAIN"
     codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" --identifier com.cnrad.interspace "$APP"
 else

@@ -40,6 +40,10 @@ enum Config {
     /// After a switch, the fade waits until the live desktop below has stopped changing,
     /// so it never shows a space that is still drawing. This is the longest it waits, in seconds.
     static let revealMaxWait: Double = 0.6
+    /// When the overlay must be removed in one step (see `fadeSafeTime`), its image is first changed to a
+    /// new capture of the live desktop, with a crossfade of this many seconds inside the window. The image
+    /// of the space can be seconds old, and without this its difference to the live desktop shows at once.
+    static let freshCrossfadeDuration: Double = 0.12
 
     // MARK: Look
 

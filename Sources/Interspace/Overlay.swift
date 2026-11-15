@@ -62,6 +62,8 @@ private final class Card {
     }
 
     func set(_ content: CardContent) {
+        image.removeAnimation(forKey: Self.crossfadeKey)
+        patch.removeAnimation(forKey: Self.crossfadeKey)
         switch content {
         case .none:
             isPresent = false
@@ -78,6 +80,20 @@ private final class Card {
             patchFrame = snapshot.patchFrame
             layoutPatch()
         }
+    }
+
+    private static let crossfadeKey = "crossfade"
+
+    /// Changes the image to another one of the same space with a fade inside the layer.
+    func crossfade(to snapshot: Snapshot, duration: CFTimeInterval) {
+        let fade = CATransition()
+        fade.type = .fade
+        fade.duration = duration
+        fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        // `set` removes a fade that runs, so the new one is added after it.
+        set(.snapshot(snapshot))
+        image.add(fade, forKey: Self.crossfadeKey)
+        patch.add(fade, forKey: Self.crossfadeKey)
     }
 
     func setDim(_ amount: CGFloat) {
@@ -233,6 +249,16 @@ final class Overlay {
         for (index, card) in cards.enumerated() {
             card.set(content(index - Self.reach))
         }
+        CATransaction.commit()
+    }
+
+    /// Changes the image of the current space, the one in the middle at progress 0, with a fade inside
+    /// the window. The window itself stays opaque.
+    func crossfadeCurrent(to snapshot: Snapshot, duration: CFTimeInterval) {
+        CATransaction.begin()
+        // Only the explicit fade: no implicit animation of the new frame of the patch.
+        CATransaction.setDisableActions(true)
+        cards[Self.reach].crossfade(to: snapshot, duration: duration)
         CATransaction.commit()
     }
 

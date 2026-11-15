@@ -114,6 +114,14 @@ final class TransitionController {
     private var liveReady = false
     /// The overlay is removed in one step at the end, with no fade. See `Overlay.canFadeOut`.
     private var revealIsCut = false
+    /// For a reveal that is cut: the overlay first changes to a new capture of the live desktop.
+    private enum FreshImage {
+        case notStarted
+        case capturing
+        /// The crossfade to it started at this time.
+        case shown(CFTimeInterval)
+    }
+    private var freshImage = FreshImage.notStarted
     private var lastSample: [UInt8]?
     private var refreshToken = 0
 
@@ -864,7 +872,7 @@ final class TransitionController {
             if revealIsCut {
                 // No fade to hide the last points of travel: wait until the picture is exactly in place.
                 if isSettled {
-                    reset()
+                    finishCutReveal(now)
                 }
             } else {
                 let alpha = 1 - CGFloat(now - phaseStart) / Config.revealDuration
@@ -890,6 +898,45 @@ final class TransitionController {
         TransitionMath.isSettled(progress: progress, velocity: velocity)
     }
 
+    /// The overlay is removed in one step. Before that, its image changes to the live desktop as it is
+    /// now, with a fade inside the window. So the step shows nothing: the image of the space can be seconds
+    /// old, and the live desktop has a new clock, new window content and so on.
+    private func finishCutReveal(_ now: CFTimeInterval) {
+        switch freshImage {
+        case .notStarted:
+            guard let layout else {
+                reset()
+                return
+            }
+            freshImage = .capturing
+            let token = stabilityToken
+            snapshotter.captureBelow(
+                windowNumber: overlay.windowNumber, screen: layout.screen, includesDock: !overlayIsBelowDock
+            ) { [weak self] snapshot in
+                guard let self, token == self.stabilityToken, self.phase == .revealing else { return }
+                guard let snapshot else {
+                    self.reset()
+                    return
+                }
+                self.overlay.crossfadeCurrent(to: snapshot, duration: Config.freshCrossfadeDuration)
+                self.freshImage = .shown(CACurrentMediaTime())
+            }
+
+        case .capturing:
+            // The capture should take a few frames. Do not keep the screen covered if it does not come.
+            if now - phaseStart > 0.5 {
+                log.info("no new capture for the end of the transition, removing the overlay anyway")
+                reset()
+            }
+
+        case .shown(let start):
+            // One frame more than the fade, so its last frame is on the display before the window goes.
+            if now - start > Config.freshCrossfadeDuration + 1.0 / 60 {
+                reset()
+            }
+        }
+    }
+
     /// Starts to look at the live desktop below the overlay near the end of the snap.
     /// It starts only when the Dock shows the new space: before that, the old space would look "ready".
     private func startLiveCheckIfNeeded(force: Bool = false) {
@@ -913,6 +960,7 @@ final class TransitionController {
         stabilityStarted = false
         lastSample = nil
         revealIsCut = !overlay.canFadeOut
+        freshImage = .notStarted
         phase = .revealing
         phaseStart = CACurrentMediaTime()
     }

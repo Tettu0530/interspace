@@ -280,10 +280,18 @@ struct TransitionPreview: View {
         let faceRadius = Self.cornerRadius / width
 
         // The sides that face the eye, the furthest first.
-        let sides = (0..<3)
-            .map { (index: $0, offset: CGFloat($0) - progress) }
-            .filter { abs($0.offset) * TransitionMath.hexFaceAngle < .pi / 2 }
-            .sorted { abs($0.offset) > abs($1.offset) }
+        // Spelled out with types, as older compilers time out inferring the chained form.
+        var sides: [(index: Int, offset: CGFloat)] = []
+        for index in 0..<3 {
+            let offset: CGFloat = CGFloat(index) - progress
+            let turn: CGFloat = abs(offset) * TransitionMath.hexFaceAngle
+            if turn < CGFloat.pi / 2 {
+                sides.append((index: index, offset: offset))
+            }
+        }
+        sides.sort { (a: (index: Int, offset: CGFloat), b: (index: Int, offset: CGFloat)) -> Bool in
+            abs(a.offset) > abs(b.offset)
+        }
 
         for side in sides {
             let face = roundedQuad(
@@ -299,13 +307,12 @@ struct TransitionPreview: View {
             for dot in 0..<count {
                 let x = (CGFloat(dot) - CGFloat(count - 1) / 2) * 0.11
                 let projected = TransitionMath.hexProject(x: x, y: 0, offset: side.offset, progress: progress)
-                let radius = 0.03 * width * projected.scale
+                let radius: CGFloat = 0.03 * width * projected.scale
                 // A circle on a turned side is narrower.
-                let squeeze = max(cos(side.offset * TransitionMath.hexFaceAngle), 0.2)
-                dots.addEllipse(in: CGRect(
-                    x: centre.x + projected.x * width - radius * squeeze, y: centre.y + projected.y * width - radius,
-                    width: radius * 2 * squeeze, height: radius * 2
-                ))
+                let squeeze: CGFloat = max(cos(side.offset * TransitionMath.hexFaceAngle), 0.2)
+                let dotX: CGFloat = centre.x + projected.x * width - radius * squeeze
+                let dotY: CGFloat = centre.y + projected.y * width - radius
+                dots.addEllipse(in: CGRect(x: dotX, y: dotY, width: radius * 2 * squeeze, height: radius * 2))
             }
             context.fill(dots, with: .color(Self.skeleton.opacity(0.35)))
 

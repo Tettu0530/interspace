@@ -6,11 +6,6 @@ DerivedData/
 *.xcodeproj/
 xcuserdata/
 
-# The benchmark tool: its build output, and the numbers and logs of one machine
-perf/.build/
-perf/results/
-perf/REPORT.md
-
 # macOS and editors
 .DS_Store
 .vscode/

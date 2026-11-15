@@ -39,9 +39,6 @@ struct TransitionPreview: View {
     /// The setting "Dock and menu bar move with the space". It changes the custom transitions only.
     var dockMovesWithSpace = true
 
-    /// Development only: draws this moment of the loop and does not move.
-    static var fixedTime: Double?
-
     /// False: the preview is at rest on space 1 and draws nothing new. A preview that moves is drawn again
     /// for each frame of the display, so only the ones the user looks at move: the selected one, and the
     /// one below the pointer.
@@ -60,14 +57,12 @@ struct TransitionPreview: View {
     static let size = CGSize(width: 188, height: 56)
 
     var body: some View {
-        let moves = isAnimating && clock.isWindowVisible && !reduceMotion && Self.fixedTime == nil
+        let moves = isAnimating && clock.isWindowVisible && !reduceMotion
         TimelineView(.animation(paused: !moves)) { timeline in
             Canvas { context, size in
                 let position: Double
                 if reduceMotion {
                     position = 0
-                } else if let fixedTime = Self.fixedTime {
-                    position = self.position(at: fixedTime)
                 } else if moves {
                     position = self.position(at: max(timeline.date.timeIntervalSinceReferenceDate - clock.start, 0))
                 } else {

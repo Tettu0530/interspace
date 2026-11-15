@@ -88,8 +88,6 @@ scripts/bundle.sh          # builds build/Interspace.app
 
 Every tuning value is in `Sources/Interspace/Config.swift`. The math of each transition is in `TransitionMath.swift`, and both the real transition and its preview in the settings window use it.
 
-`perf/` is a benchmark build of the same sources.
-
 ## Credits
 
 The synthetic swipe and its macOS 27 event format come from [InstantSpaceSwitcher](https://github.com/jurplel/InstantSpaceSwitcher) by jurplel (MIT).

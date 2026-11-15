@@ -102,26 +102,6 @@ final class TransitionController {
     private var lastSample: [UInt8]?
     private var refreshToken = 0
 
-    // Timing of the snap, for the log.
-    private var settleStart: CFTimeInterval = 0
-    private var settleFrames = 0
-    private var linkStartCount = 0
-    /// Milliseconds from the release until the Dock showed the new space. -1 while not known.
-    private var dockLandedAfter = -1
-    private var settleFrom: CGFloat = 0
-
-    // Frame timing of the swipe in progress, for the log. A long gap is a stutter the user saw.
-    /// Touch frames that moved the picture, and the longest time between two of them on the main thread.
-    private var dragFrames = 0
-    private var dragStart: CFTimeInterval = 0
-    private var dragLongestGap: CFTimeInterval = 0
-    /// Milliseconds from touch down to the first picture. -1 while there is none.
-    private var firstPictureAfter = -1
-    /// Display frames after the release, the longest time between two of them, and the frames that were lost.
-    private var snapFrames = 0
-    private var snapLongestGap: CFTimeInterval = 0
-    private var snapLostFrames = 0
-    private var snapFrameTime: CFTimeInterval = 0
 
     /// Space indexes still to visit, in order. The last one is the space the visit started on.
     /// A swipe in the Instant transition is in progress, and it has already switched (or cannot).
@@ -222,13 +202,8 @@ final class TransitionController {
         lastFrameTime = now
         startWatchdog()
 
-        dragFrames = 0
-        dragStart = now
-        dragLongestGap = 0
-
         if overlay.isVisible {
             // Catch the transition in flight and continue from where it is.
-            logSnap()
             log.notice("begin: caught the overlay in phase \(String(describing: self.phase), privacy: .public) at progress \(self.progress)")
             stopLink()
             stabilityToken += 1
@@ -346,10 +321,6 @@ final class TransitionController {
         }
         guard phase == .dragging, pendingRelease == nil else { return }
         let now = CACurrentMediaTime()
-        // Trackpad reports come at a constant rate while the fingers are down, so a long gap here means
-        // the main thread was late, and the picture did not follow the fingers for that time.
-        dragLongestGap = max(dragLongestGap, now - lastFrameTime)
-        dragFrames += 1
         lastFrameTime = now
         var raw = dragOrigin + Self.progress(forFingerTravel: dx)
 
@@ -386,11 +357,6 @@ final class TransitionController {
         let releaseVelocity = Self.progress(forFingerTravel: fingerVelocity)
         let target = cancelled ? 0 : self.target(for: progress, velocity: releaseVelocity)
         log.notice("end: progress \(self.progress) velocity \(releaseVelocity) target \(target) overlay \(self.overlay.isVisible) captureFinished \(self.captureFinished) captureFailed \(self.captureFailed)")
-        if dragFrames > 0 {
-            let duration = Int((CACurrentMediaTime() - dragStart) * 1000)
-            let gap = String(format: "%.1f", dragLongestGap * 1000)
-            log.notice("drag: \(self.dragFrames) frames in \(duration) ms, longest gap \(gap, privacy: .public) ms, first picture \(self.firstPictureAfter) ms after touch down")
-        }
 
         if overlay.isVisible {
             commit(target: target, velocity: releaseVelocity)
@@ -484,7 +450,6 @@ final class TransitionController {
 
     private func commit(target: Int, velocity releaseVelocity: CGFloat) {
         // A press of the shortcut during a snap starts the next one here.
-        logSnap()
         if target != 0 {
             retarget(by: target)
         }
@@ -493,10 +458,6 @@ final class TransitionController {
         stabilityStarted = false
         liveReady = false
         phase = .settling
-        settleStart = CACurrentMediaTime()
-        settleFrames = 0
-        dockLandedAfter = -1
-        settleFrom = progress
         startLink()
     }
 
@@ -614,7 +575,6 @@ final class TransitionController {
         guard let layout else { return }
         setBase(layout.currentIndex)
         unpackNearImages()
-        firstPictureAfter = -1
         captureStarted = CACurrentMediaTime()
 
         let token = captureToken
@@ -709,7 +669,7 @@ final class TransitionController {
                 where abs(index - layout.currentIndex) > Config.fullImageRadius {
                     guard let snapshot = self.cache[spaceID], !self.packing.contains(spaceID) else { continue }
                     self.packing.insert(spaceID)
-                    Self.packQueue.async {
+                    Self.packQueue.async { [weak self] in
                         let stored = PackedSnapshot(snapshot)
                         DispatchQueue.main.async { [weak self] in
                             guard let self else { return }
@@ -734,7 +694,7 @@ final class TransitionController {
         for (index, spaceID) in layout.spaceIDs.enumerated() where abs(index - baseIndex) <= Config.fullImageRadius {
             guard let stored = packed[spaceID], !unpacking.contains(spaceID) else { continue }
             unpacking.insert(spaceID)
-            Self.unpackQueue.async {
+            Self.unpackQueue.async { [weak self] in
                 let snapshot = stored.unpacked()
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
@@ -793,9 +753,6 @@ final class TransitionController {
         overlay.render(progress: progress)
         CATransaction.commit()
         overlay.present()
-        if firstPictureAfter < 0 {
-            firstPictureAfter = Int((CACurrentMediaTime() - captureStarted) * 1000)
-        }
     }
 
     private func assignCards() {
@@ -835,7 +792,6 @@ final class TransitionController {
     private func startLink() {
         guard link == nil, let screen = layout?.screen ?? NSScreen.main else { return }
         let link = screen.displayLink(target: self, selector: #selector(tick(_:)))
-        linkStartCount += 1
         link.add(to: .main, forMode: .common)
         self.link = link
         lastTick = 0
@@ -849,16 +805,6 @@ final class TransitionController {
     @objc private func tick(_ link: CADisplayLink) {
         let now = link.timestamp
         let delta = lastTick == 0 ? link.duration : min(now - lastTick, 1.0 / 30)
-        if lastTick != 0 {
-            let gap = now - lastTick
-            snapLongestGap = max(snapLongestGap, gap)
-            // One and a half frame times or more between two frames: at least one frame was lost.
-            if gap > link.duration * 1.5 {
-                snapLostFrames += Int((gap / link.duration).rounded()) - 1
-            }
-        }
-        snapFrames += 1
-        snapFrameTime = link.duration
         lastTick = now
 
         if phase == .settling || phase == .holding || phase == .revealing {
@@ -868,11 +814,7 @@ final class TransitionController {
         switch phase {
         case .settling:
             stepSpring(CGFloat(delta))
-            settleFrames += 1
             overlay.render(progress: progress)
-            if didSwitch, dockLandedAfter < 0, dockHasLanded {
-                dockLandedAfter = Int((CACurrentMediaTime() - settleStart) * 1000)
-            }
             startLiveCheckIfNeeded()
             if abs(progress) < Config.revealStartDistance {
                 // Close enough: the last points of travel finish below the fade.
@@ -921,17 +863,6 @@ final class TransitionController {
         TransitionMath.isSettled(progress: progress, velocity: velocity)
     }
 
-    /// Writes the frame timing of the snap that ends now, or that a new swipe or key press takes over.
-    private func logSnap() {
-        guard snapFrames > 0 else { return }
-        let gap = String(format: "%.1f", snapLongestGap * 1000)
-        let frameTime = String(format: "%.1f", snapFrameTime * 1000)
-        log.notice("snap: \(self.snapFrames) frames, longest gap \(gap, privacy: .public) ms, lost \(self.snapLostFrames), frame time \(frameTime, privacy: .public) ms")
-        snapFrames = 0
-        snapLongestGap = 0
-        snapLostFrames = 0
-    }
-
     /// Starts to look at the live desktop below the overlay near the end of the snap.
     /// It starts only when the Dock shows the new space: before that, the old space would look "ready".
     private func startLiveCheckIfNeeded(force: Bool = false) {
@@ -951,8 +882,6 @@ final class TransitionController {
     }
 
     private func startReveal() {
-        let milliseconds = Int((CACurrentMediaTime() - settleStart) * 1000)
-        log.notice("\(self.overlay.canFadeOut ? "fade" : "cut", privacy: .public) starts \(milliseconds) ms after release, from \(self.settleFrom); Dock showed the new space after \(self.dockLandedAfter) ms")
         stabilityToken += 1
         stabilityStarted = false
         lastSample = nil
@@ -1216,8 +1145,6 @@ final class TransitionController {
         didSwitch = true
         stabilityStarted = false
         liveReady = false
-        settleStart = CACurrentMediaTime()
-        settleFrom = 0
         phase = .holding
         phaseStart = CACurrentMediaTime()
         startLink()
@@ -1244,7 +1171,6 @@ final class TransitionController {
             refreshCurrentSpace(refreshToken)
         }
         packFarImages(refreshToken)
-        logSnap()
         phase = .idle
         layout = nil
         progress = 0

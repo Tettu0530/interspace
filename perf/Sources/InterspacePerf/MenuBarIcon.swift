@@ -1,1 +1,0 @@
-../../../Sources/Interspace/MenuBarIcon.swift

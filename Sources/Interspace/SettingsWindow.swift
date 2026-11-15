@@ -193,6 +193,9 @@ struct SettingsView: View {
                     .disabled(!settings.transition.isDrawn)
                 SwitchRow(title: "Rounded corners", isOn: $settings.roundedCorners)
                     .disabled(!settings.transition.isDrawn)
+                // About the app and not the transition, so it is never disabled. With the icon hidden, this
+                // window is the only way back to it.
+                SwitchRow(title: "Show in menu bar", isOn: $settings.showsMenuBarIcon)
             }
             // In line with the names in the list on the left, and with the previews on the right.
             .padding(.horizontal, SettingsLayout.inset)

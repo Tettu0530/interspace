@@ -128,6 +128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // change the shortcuts in System Settings.
         SpaceShortcuts.update(enabled: active && keyTapInstalled)
         statusItem?.button?.appearsDisabled = !active
+        if let statusItem, statusItem.isVisible != settings.showsMenuBarIcon {
+            statusItem.isVisible = settings.showsMenuBarIcon
+        }
         updatePolling()
     }
 
@@ -190,13 +193,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
+        item.isVisible = settings.showsMenuBarIcon
         statusItem = item
+    }
+
+    /// The user opened the app again while it runs: from Spotlight, Finder or Launchpad. This is the way
+    /// to the settings when the icon is hidden, and it does the same when the icon is there.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        settingsWindow.show()
+        return false
     }
 
     /// Hides the icon and gives its place on `screen`, for the loader on the cover of the visit of all
     /// spaces. `nil`, and the icon stays, when the icon is not on that screen or the menu bar is not shown.
     private func hideIconForLoader(on screen: NSScreen) -> Overlay.Loader? {
-        guard let button = statusItem?.button, let window = button.window,
+        guard settings.showsMenuBarIcon, let button = statusItem?.button, let window = button.window,
               window.occlusionState.contains(.visible)
         else { return nil }
         let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
@@ -229,6 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let login = actionItem("Open at Login", #selector(toggleOpensAtLogin))
         login.state = opensAtLogin ? .on : .off
         menu.addItem(login)
+
+        menu.addItem(actionItem("Hide from Menu Bar…", #selector(hideFromMenuBar)))
 
         var problems: [NSMenuItem] = []
         if !hasAccessibility {
@@ -294,6 +307,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleOpensAtLogin() {
         setOpensAtLogin(!opensAtLogin)
+    }
+
+    /// Asks first: with no icon there is no menu, so the user must know the way back before it goes.
+    @objc private func hideFromMenuBar() {
+        let alert = NSAlert()
+        alert.messageText = "Hide Interspace from the menu bar?"
+        alert.informativeText = "Interspace stays on. To get to its settings, open Interspace again "
+            + "from Spotlight or the Applications folder. “Show in menu bar” there brings the icon back."
+        alert.addButton(withTitle: "Hide")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // The observer of the settings takes the icon away. See `evaluate`.
+        settings.showsMenuBarIcon = false
     }
 
     @objc private func captureSpaces() {

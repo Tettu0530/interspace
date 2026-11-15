@@ -5,7 +5,9 @@ A fast, customizable space switcher for macOS.
 
 <video src="https://github.com/user-attachments/assets/443c510a-2e49-4f93-b2d6-de9025866159" controls muted aria-label="A three-finger swipe between desktops on a MacBook, shown with several Interspace transitions"></video>
 
-macOS has one animation for a three-finger swipe between desktops, and no setting for it. Interspace replaces that animation with one you choose, follows your fingers while you swipe, and finishes faster.
+Switching desktops on macOS is slow. Unbearably slow. The slide animation scales with your display's refresh rate, so on a 120Hz ProMotion display it takes twice as long as at 60Hz: a full second from the swipe until the desktop you landed on is responsive. The slide looks finished well before that, but your clicks and keys go nowhere until it has settled. macOS has exactly one animation for this, and no options to change it.
+
+Interspace is a small app that replaces that transition with one you choose, or with none at all. It follows your fingers, so one swipe can pass several desktops, and a key press in the middle of a transition starts the next one at once instead of being ignored.
 
 ## Install
 

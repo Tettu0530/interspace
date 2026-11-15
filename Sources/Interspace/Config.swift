@@ -45,6 +45,11 @@ enum Config {
     /// of the space can be seconds old, and without this its difference to the live desktop shows at once.
     static let freshCrossfadeDuration: Double = 0.12
 
+    /// The real switch waits until the overlay has been on screen this long, in seconds. A window that was
+    /// just ordered in shows from the next frame of the display or later. A switch posted in the same moment
+    /// (a fast flick) shows the new space in its final place for a frame, before the overlay covers it.
+    static let overlayShowTime: Double = 0.05
+
     // MARK: Look
 
     /// How much each screen shrinks during the transition (0.06 = 94% size).

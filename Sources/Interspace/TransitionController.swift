@@ -532,6 +532,10 @@ final class TransitionController {
     private func pumpDock() {
         guard layout != nil, dockIndex != baseIndex else { return }
         let now = CACurrentMediaTime()
+        // The overlay must be on the display before the switch shows below it. `tick` calls this again.
+        if overlay.isVisible, now - overlay.presentedAt < Config.overlayShowTime {
+            return
+        }
         if dockPostTime > 0, !dockIsOn(dockIndex) {
             guard now - dockPostTime > 1.0 else { return }
             log.error("the Dock did not reach index \(self.dockIndex)")
@@ -836,7 +840,7 @@ final class TransitionController {
         let delta = lastTick == 0 ? link.targetTimestamp - link.timestamp : min(now - lastTick, 1.0 / 30)
         lastTick = now
 
-        if phase == .settling || phase == .holding || phase == .revealing {
+        if phase == .dragging || phase == .settling || phase == .holding || phase == .revealing {
             pumpDock()
         }
 

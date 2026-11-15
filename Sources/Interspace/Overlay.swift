@@ -112,6 +112,14 @@ final class Overlay {
 
     private(set) var isVisible = false
 
+    /// Where the loader goes on the cover, in screen coordinates, and its colour.
+    struct Loader {
+        let frame: CGRect
+        let color: CGColor
+    }
+
+    private var loaderLayer: CALayer?
+
     /// The transition to draw. Set it before `setCards`.
     var style = TransitionStyle.lightweight
 
@@ -364,8 +372,25 @@ final class Overlay {
         isVisible = true
     }
 
+    /// Draws a loader above the screens, or removes it with `nil`. Call after `attach(to:)`.
+    /// It is for the cover of the visit of all spaces only: `hide()` removes it.
+    func showLoader(_ loader: Loader?) {
+        loaderLayer?.removeFromSuperlayer()
+        loaderLayer = nil
+        guard let loader, panel.frame.contains(loader.frame) else { return }
+        let layer = MenuBarIcon.loaderLayer(color: loader.color)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.position = CGPoint(x: loader.frame.midX - panel.frame.minX, y: loader.frame.midY - panel.frame.minY)
+        layer.zPosition = 10_000
+        root.addSublayer(layer)
+        CATransaction.commit()
+        loaderLayer = layer
+    }
+
     func hide() {
         panel.orderOut(nil)
+        showLoader(nil)
         // The alpha stays as it is. `present()` sets it, so a hidden window can never show at full alpha.
         isVisible = false
         // Release the screen-size images.

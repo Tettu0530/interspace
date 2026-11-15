@@ -44,6 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         log.notice("opens at login: \(self.opensAtLogin)")
 
+        controller.hideMenuBarIcon = { [weak self] screen in
+            self?.hideIconForLoader(on: screen)
+        }
+        controller.showMenuBarIcon = { [weak self] in
+            self?.statusItem?.button?.alphaValue = 1
+        }
+
         SpaceShortcuts.onStep = { [weak self] step in
             self?.controller.keyboardStep(step)
         }
@@ -184,6 +191,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         statusItem = item
+    }
+
+    /// Hides the icon and gives its place on `screen`, for the loader on the cover of the visit of all
+    /// spaces. `nil`, and the icon stays, when the icon is not on that screen or the menu bar is not shown.
+    private func hideIconForLoader(on screen: NSScreen) -> Overlay.Loader? {
+        guard let button = statusItem?.button, let window = button.window,
+              window.occlusionState.contains(.visible)
+        else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        guard screen.frame.contains(frame) else { return nil }
+        // The menu bar is light or dark with the wallpaper, and the icon is the opposite. So is the loader.
+        let dark = button.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let alpha: CGFloat = button.appearsDisabled ? 0.35 : 1
+        button.alphaValue = 0
+        return Overlay.Loader(frame: frame, color: CGColor(gray: dark ? 1 : 0, alpha: alpha))
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {

@@ -61,19 +61,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.invalidateShadow()
-        PreviewClock.shared.isWindowVisible = true
-        PreviewClock.shared.restart()
-    }
-
-    /// The previews move only while the window can be seen: not when it is covered or on another space.
-    func windowDidChangeOcclusionState(_ notification: Notification) {
-        guard let window, notification.object as? NSWindow === window else { return }
-        let visible = window.occlusionState.contains(.visible)
-        guard visible != PreviewClock.shared.isWindowVisible else { return }
-        PreviewClock.shared.isWindowVisible = visible
-        if visible {
-            PreviewClock.shared.restart()
-        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -176,7 +163,6 @@ struct SettingsView: View {
                     TransitionRow(
                         style: style,
                         speed: settings.speed,
-                        sensitivity: settings.sensitivity,
                         dockMovesWithSpace: settings.dockMovesWithSpace,
                         isSelected: settings.transition == style
                     ) {
@@ -465,7 +451,6 @@ private final class HoverState: ObservableObject {
 private struct TransitionRow: View {
     let style: TransitionStyle
     let speed: Double
-    let sensitivity: Double
     let dockMovesWithSpace: Bool
     let isSelected: Bool
     let select: () -> Void
@@ -484,8 +469,7 @@ private struct TransitionRow: View {
                 Spacer(minLength: 12)
 
                 TransitionPreview(
-                    style: style, speed: speed, sensitivity: sensitivity, dockMovesWithSpace: dockMovesWithSpace,
-                    isAnimating: isSelected || hover.isHovered
+                    style: style, speed: speed, dockMovesWithSpace: dockMovesWithSpace
                 )
             }
             // The same space left of the text as right of the preview.
@@ -506,13 +490,7 @@ private struct TransitionRow: View {
             .contentShape(RoundedRectangle(cornerRadius: SettingsLayout.rowRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .onHover { hovered in
-            // The preview of this row starts to move now. The selected row already moves.
-            if hovered, !hover.isHovered, !isSelected {
-                PreviewClock.shared.restart()
-            }
-            hover.isHovered = hovered
-        }
+        .onHover { hover.isHovered = $0 }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

@@ -46,4 +46,33 @@ enum MenuBarIcon {
         context.addPath(frontPath)
         context.strokePath()
     }
+
+    /// A turning arc that takes the place of the icon while the app captures all spaces.
+    /// Its line is the line of the icon, so it reads as the same mark at work.
+    static func loaderLayer(color: CGColor) -> CALayer {
+        let diameter: CGFloat = 12
+        let lineWidth: CGFloat = 1.25
+        let layer = CAShapeLayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: diameter, height: diameter)
+        let inset = layer.bounds.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
+        let arc = CGMutablePath()
+        arc.addArc(
+            center: CGPoint(x: inset.midX, y: inset.midY), radius: inset.width / 2,
+            startAngle: 0, endAngle: .pi * 1.5, clockwise: false
+        )
+        layer.path = arc
+        layer.fillColor = nil
+        layer.strokeColor = color
+        layer.lineWidth = lineWidth
+        layer.lineCap = .round
+
+        let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+        turn.fromValue = 0
+        // Clockwise: the layer counts angles from the bottom left.
+        turn.toValue = -2 * CGFloat.pi
+        turn.duration = 0.8
+        turn.repeatCount = .infinity
+        layer.add(turn, forKey: "turn")
+        return layer
+    }
 }

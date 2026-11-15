@@ -12,40 +12,14 @@ import SwiftUI
 /// - Hexagon: the display is fixed here too, as the spaces turn in front of it.
 /// - Magnetic: the display is fixed, because each space has its own size that depends on where it is.
 /// - Stack: the display is fixed on the pile, and a second pile beside it is the spaces that wait.
-/// The time all previews count from, and if the settings window can be seen.
-///
-/// The previews that move use one clock, so they start their moves together. The clock starts again when
-/// one more preview starts to move: that one then starts from rest, with no jump, and the others start
-/// with it, so the two can be compared.
-final class PreviewClock: ObservableObject {
-    static let shared = PreviewClock()
-
-    /// Seconds on the clock of `Date.timeIntervalSinceReferenceDate`.
-    @Published private(set) var start = Date().timeIntervalSinceReferenceDate
-    /// False when the window is covered, on another space, or closed. Nothing moves then.
-    @Published var isWindowVisible = true
-
-    func restart() {
-        start = Date().timeIntervalSinceReferenceDate
-    }
-}
-
 struct TransitionPreview: View {
     let style: TransitionStyle
     /// The speed setting. It changes the custom transitions only.
     let speed: Double
-    /// The gesture sensitivity setting. It changes the transitions the app draws only.
-    var sensitivity: Double = 1
     /// The setting "Dock and menu bar move with the space". It changes the custom transitions only.
     var dockMovesWithSpace = true
 
-    /// False: the preview is at rest on space 1 and draws nothing new. A preview that moves is drawn again
-    /// for each frame of the display, so only the ones the user looks at move: the selected one, and the
-    /// one below the pointer.
-    var isAnimating = true
-
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @ObservedObject private var clock = PreviewClock.shared
 
     /// Every transition gets the same time slot for one move and its pause, so all previews start
     /// their moves together and the faster one visibly arrives first.
@@ -57,17 +31,10 @@ struct TransitionPreview: View {
     static let size = CGSize(width: 188, height: 56)
 
     var body: some View {
-        let moves = isAnimating && clock.isWindowVisible && !reduceMotion
-        TimelineView(.animation(paused: !moves)) { timeline in
+        TimelineView(.animation(paused: reduceMotion)) { timeline in
             Canvas { context, size in
-                let position: Double
-                if reduceMotion {
-                    position = 0
-                } else if moves {
-                    position = self.position(at: max(timeline.date.timeIntervalSinceReferenceDate - clock.start, 0))
-                } else {
-                    position = 0
-                }
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                let position = reduceMotion ? 0 : position(at: time)
                 switch style {
                 case .system, .lightweight, .instant: drawSlide(in: &context, size: size, position: position)
                 case .hexagon: drawHexagon(in: &context, size: size, position: position)
@@ -111,12 +78,11 @@ struct TransitionPreview: View {
             let firstMovement = Double(Config.directionSlop / Config.travelPerTrackpadWidth) / fingerVelocity
             return elapsed >= firstMovement ? 1 : 0
         }
-        // The fingers always make the same movement. With a higher sensitivity it takes the screen further,
-        // and faster. The preview shows one space per swipe, so the screen stops at the next space when the
-        // fingers would take it past that.
-        let reach = style.isDrawn ? sensitivity : 1
-        let dragVelocity = fingerVelocity * reach
-        let released = min(Self.releaseProgress * reach, 1)
+        // The fingers always make the same movement, at a sensitivity of 1. The sensitivity setting is not
+        // in the preview: it changes how far the fingers take the screen, not how the transition looks, and
+        // only the speed setting may change the pace of the preview.
+        let dragVelocity = fingerVelocity
+        let released = Self.releaseProgress
 
         // Under the fingers: the screen follows them directly.
         guard elapsed > Self.dragDuration else {

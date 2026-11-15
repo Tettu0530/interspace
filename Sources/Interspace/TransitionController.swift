@@ -81,6 +81,17 @@ final class TransitionController {
     private var wallpaperGeneration = 0
     private var knownSpaces: [String: [UInt64]] = [:]
 
+    /// The visit of all spaces freezes the screen below a picture of it. A loader on that picture, where
+    /// the menu bar icon is, shows that the app is at work. The real icon cannot do this: it is below the cover.
+    ///
+    /// `hideMenuBarIcon` is called before the picture for the cover is taken. It hides the icon, so the
+    /// picture has an empty place for the loader, and returns that place. `nil`: no loader on this screen.
+    var hideMenuBarIcon: ((NSScreen) -> Overlay.Loader?)?
+    /// Called when the cover is on screen and hides the menu bar, and when a visit stops for any reason.
+    var showMenuBarIcon: (() -> Void)?
+    /// How long the menu bar needs to draw without the icon before the picture is taken.
+    private static let iconHideTime = 0.08
+
     private var link: CADisplayLink?
     private var lastTick: CFTimeInterval = 0
     private var phaseStart: CFTimeInterval = 0
@@ -1004,8 +1015,15 @@ final class TransitionController {
         tourOriginSample = nil
 
         /// Shows the cover, then starts the visit.
-        func begin(cover: Snapshot) {
+        func begin(cover: Snapshot, loader: Overlay.Loader? = nil) {
             presentCover(cover)
+            overlay.showLoader(loader)
+            if loader != nil {
+                // The icon comes back below the cover. Not at once: the cover must be on screen first.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.showMenuBarIcon?()
+                }
+            }
             // The captures below need to know the overlay window, which is on screen only now.
             snapshotter.refreshDisplays { [weak self] in
                 guard let self, self.isTouring(token) else { return }
@@ -1025,19 +1043,25 @@ final class TransitionController {
                 return
             }
             self.store(snapshot, for: layout.spaceIDs[origin])
-            if snapshot.includesDock {
+            // The image above is for the transitions, so it has the icon in it. The cover gets its own.
+            let loader = self.hideMenuBarIcon?(layout.screen)
+            if snapshot.includesDock, loader == nil {
                 begin(cover: snapshot)
                 return
             }
-            // The image for the transition has no Dock and no menu bar. The cover must have them, because it
-            // is above everything: take one more image, of the whole screen.
-            self.snapshotter.capture(screen: layout.screen, includeDock: true) { [weak self] full in
+            // One more image, of the whole screen, for one of two reasons. The image for the transition has no
+            // Dock and no menu bar, and the cover must have them, because it is above everything. Or the cover
+            // gets a loader, and the image must not have the icon where the loader goes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + (loader == nil ? 0 : Self.iconHideTime)) { [weak self] in
                 guard let self, self.isTouring(token) else { return }
-                guard let full else {
-                    self.reset()
-                    return
+                self.snapshotter.capture(screen: layout.screen, includeDock: true) { [weak self] full in
+                    guard let self, self.isTouring(token) else { return }
+                    guard let full else {
+                        self.reset()
+                        return
+                    }
+                    begin(cover: full, loader: loader)
                 }
-                begin(cover: full)
             }
         }
     }
@@ -1185,6 +1209,7 @@ final class TransitionController {
         tourToken += 1
         // Only the end of a visit of all spaces uses this. A swipe must not wait for that desktop.
         tourOriginSample = nil
+        showMenuBarIcon?()
     }
 
     /// Captures the space we just arrived on, now that the overlay is gone and the desktop is at rest.

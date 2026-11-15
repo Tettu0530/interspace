@@ -1,8 +1,8 @@
 # Interspace
 
-Custom transitions for switching between desktops (Spaces) on macOS.
+A fast, customizable space switcher for macOS. 
 
-<img src="assets/demo.webp" alt="A three-finger swipe between desktops on a MacBook, shown with several Interspace transitions" width="720">
+<video src="https://github.com/user-attachments/assets/443c510a-2e49-4f93-b2d6-de9025866159" controls muted aria-label="A three-finger swipe between desktops on a MacBook, shown with several Interspace transitions"></video>
 
 macOS has one animation for a three-finger swipe between desktops, and no setting for it. Interspace replaces that animation with one you choose, follows your fingers while you swipe, and finishes faster.
 

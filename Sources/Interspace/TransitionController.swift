@@ -985,11 +985,12 @@ final class TransitionController {
             if let origin = self.tourOriginSample {
                 // After a visit of all spaces: not "has it stopped changing" but "is it the desktop we
                 // started on". A desktop that was visited can look still and be the wrong one.
-                if Snapshotter.samplesMatch(origin, sample, sameDesktop: true) {
+                if Snapshotter.samplesMatch(origin, sample, sameDesktop: true), self.activationHasSettled() {
                     self.liveReady = true
                     return
                 }
-            } else if let previous = self.lastSample, Snapshotter.samplesMatch(previous, sample) {
+            } else if let previous = self.lastSample, Snapshotter.samplesMatch(previous, sample),
+                      self.activationHasSettled() {
                 self.liveReady = true
                 return
             }
@@ -1004,6 +1005,32 @@ final class TransitionController {
                 }
             }
         }
+    }
+
+    /// True when the active app owns the frontmost window of the desktop below the overlay, or when there
+    /// is no window. After a switch macOS makes that app active a little after the desktop shows. The samples
+    /// are too small to see the difference (the title bar and its buttons), so without this the overlay can
+    /// go while the window still looks inactive, and it turns active a moment later in plain view.
+    private func activationHasSettled() -> Bool {
+        guard let layout,
+              let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+              let windows = CGWindowListCopyWindowInfo(
+                  [.optionOnScreenBelowWindow, .excludeDesktopElements], CGWindowID(overlay.windowNumber)
+              ) as? [[String: Any]]
+        else { return true }
+        let display = CGDisplayBounds(layout.screen.displayID)
+        // Front to back. The first normal window that is on this display decides.
+        for window in windows {
+            guard (window[kCGWindowLayer as String] as? Int) == 0,
+                  let owner = window[kCGWindowOwnerPID as String] as? pid_t,
+                  (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let boundsInfo = window[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsInfo as CFDictionary),
+                  bounds.intersects(display)
+            else { continue }
+            return owner == front
+        }
+        return true
     }
 
     private func stepSpring(_ delta: CGFloat) {

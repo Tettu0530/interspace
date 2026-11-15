@@ -96,6 +96,10 @@ final class TransitionController {
     private var lastTick: CFTimeInterval = 0
     private var phaseStart: CFTimeInterval = 0
     private var lastFrameTime: CFTimeInterval = 0
+    /// The fingers moved since the last frame. The picture is drawn on the next frame of the display, not
+    /// at each touch: touches do not come at the rate of the display, so drawing at each one moves the
+    /// picture by uneven steps, which flickers on a 60 Hz display.
+    private var dragNeedsRender = false
     private var watchdog: Timer?
 
     /// The Dock reports intermediate state for a moment after a synthetic swipe, so our own
@@ -184,7 +188,7 @@ final class TransitionController {
     // MARK: - Gesture
 
     private var isInstant: Bool {
-        AppSettings.shared.transition == .instant
+        AppSettings.shared.effectiveTransition == .instant
     }
 
     private func arm() {
@@ -216,16 +220,18 @@ final class TransitionController {
         if overlay.isVisible {
             // Catch the transition in flight and continue from where it is.
             log.notice("begin: caught the overlay in phase \(String(describing: self.phase), privacy: .public) at progress \(self.progress)")
-            stopLink()
             stabilityToken += 1
             stabilityStarted = false
             liveReady = false
+            dragNeedsRender = false
             overlay.alpha = 1
             pendingRelease = nil
             keyPending = false
             dragOrigin = progress
             velocity = 0
             phase = .dragging
+            // The link may already run from the snap. It keeps going, now to draw the drag.
+            startLink()
             return
         }
 
@@ -245,7 +251,9 @@ final class TransitionController {
         didSwitch = false
         pendingRelease = nil
         keyPending = false
+        dragNeedsRender = false
         phase = .dragging
+        startLink()
         if captureFinished, !captureFailed {
             present()
         }
@@ -351,9 +359,8 @@ final class TransitionController {
         pumpDock()
 
         progress = constrain(raw)
-        if overlay.isVisible {
-            overlay.render(progress: progress)
-        }
+        // Drawn in `tick`, one time for each frame of the display.
+        dragNeedsRender = overlay.isVisible
     }
 
     private func end(velocity fingerVelocity: CGFloat, cancelled: Bool) {
@@ -468,6 +475,7 @@ final class TransitionController {
         stabilityToken += 1
         stabilityStarted = false
         liveReady = false
+        dragNeedsRender = false
         phase = .settling
         startLink()
     }
@@ -756,7 +764,7 @@ final class TransitionController {
             log.notice("replaced the overlay window before it was shown: it was not on every desktop")
         }
         overlay.isBelowDock = overlayIsBelowDock
-        overlay.style = AppSettings.shared.transition
+        overlay.style = AppSettings.shared.effectiveTransition
         overlay.roundsCorners = AppSettings.shared.roundedCorners
         CATransaction.begin()
         overlay.attach(to: layout.screen)
@@ -814,8 +822,10 @@ final class TransitionController {
     }
 
     @objc private func tick(_ link: CADisplayLink) {
-        let now = link.timestamp
-        let delta = lastTick == 0 ? link.duration : min(now - lastTick, 1.0 / 30)
+        // The time at which this frame shows, not the time of the frame before. The picture is then where
+        // it should be when it is on the display. At 60 Hz the two are 17 ms apart, a visible lag.
+        let now = link.targetTimestamp
+        let delta = lastTick == 0 ? link.targetTimestamp - link.timestamp : min(now - lastTick, 1.0 / 30)
         lastTick = now
 
         if phase == .settling || phase == .holding || phase == .revealing {
@@ -865,7 +875,13 @@ final class TransitionController {
                 }
             }
 
-        case .idle, .dragging, .touring:
+        case .dragging:
+            if dragNeedsRender, overlay.isVisible {
+                overlay.render(progress: progress)
+            }
+            dragNeedsRender = false
+
+        case .idle, .touring:
             break
         }
     }
@@ -965,7 +981,7 @@ final class TransitionController {
     /// captures each one, and comes back. It takes about a second.
     /// `again` also replaces the images we already have.
     func captureAllSpaces(again: Bool = false) {
-        guard isEnabled, AppSettings.shared.transition.isDrawn, phase == .idle, !overlay.isVisible,
+        guard isEnabled, AppSettings.shared.effectiveTransition.isDrawn, phase == .idle, !overlay.isVisible,
               let layout = currentLayout(), layout.spaceIDs.count > 1
         else { return }
 

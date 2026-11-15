@@ -1,5 +1,5 @@
+import AppKit
 import Combine
-import Foundation
 
 /// The transitions the user can choose.
 enum TransitionStyle: String, CaseIterable, Identifiable {
@@ -96,6 +96,15 @@ final class AppSettings: ObservableObject {
     /// the user opens the app again while it runs.
     @Published var showsMenuBarIcon: Bool {
         didSet { defaults.set(showsMenuBarIcon, forKey: Self.showsMenuBarIconKey) }
+    }
+
+    /// The transition that runs. With "Reduce motion" on in the accessibility settings of macOS, a drawn
+    /// transition becomes Instant: a screen that slides is what that setting is there to stop.
+    var effectiveTransition: TransitionStyle {
+        if transition.isDrawn, NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            return .instant
+        }
+        return transition
     }
 
     /// The transition to go back to when the user turns the custom transition on again.

@@ -1,6 +1,7 @@
 # Interspace
 
-A fast, customizable space switcher for macOS. 
+A fast, customizable space switcher for macOS.
+
 
 <video src="https://github.com/user-attachments/assets/443c510a-2e49-4f93-b2d6-de9025866159" controls muted aria-label="A three-finger swipe between desktops on a MacBook, shown with several Interspace transitions"></video>
 

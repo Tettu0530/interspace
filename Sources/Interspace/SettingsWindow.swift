@@ -61,6 +61,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.invalidateShadow()
+        PreviewClock.shared.isWindowVisible = true
+        PreviewClock.shared.restart()
+    }
+
+    /// The previews move only while the window can be seen: not when it is covered or on another space.
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window, notification.object as? NSWindow === window else { return }
+        let visible = window.occlusionState.contains(.visible)
+        guard visible != PreviewClock.shared.isWindowVisible else { return }
+        PreviewClock.shared.isWindowVisible = visible
+        if visible {
+            PreviewClock.shared.restart()
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -181,15 +194,20 @@ struct SettingsView: View {
                 .padding(.vertical, 16)
                 .background(WindowDragRegion())
 
-            // What applies to every transition the app draws. macOS draws its own, and Instant draws nothing.
+            // Three of these are about the picture, so they apply to the transitions the app draws.
+            // macOS draws its own, and Instant draws nothing.
             VStack(spacing: 12) {
                 SliderRow(title: "Speed", value: $settings.speed, range: AppSettings.speedRange)
-                // How far the screens move for the same finger travel. High enough, one swipe passes several spaces.
+                    .disabled(!settings.transition.isDrawn)
+                // How far a swipe goes for the same finger travel. High enough, one swipe passes several spaces.
+                // Instant has this too: it counts the spaces, with no picture.
                 SliderRow(title: "Swipe sensitivity", value: $settings.sensitivity, range: AppSettings.sensitivityRange)
+                    .disabled(!settings.transition.isCustom)
                 SwitchRow(title: "Dock and menu bar move with the space", isOn: $settings.dockMovesWithSpace)
+                    .disabled(!settings.transition.isDrawn)
                 SwitchRow(title: "Rounded corners", isOn: $settings.roundedCorners)
+                    .disabled(!settings.transition.isDrawn)
             }
-            .disabled(!settings.transition.isDrawn)
             // In line with the names in the list on the left, and with the previews on the right.
             .padding(.horizontal, SettingsLayout.inset)
             .padding(.bottom, 18)
@@ -466,7 +484,8 @@ private struct TransitionRow: View {
                 Spacer(minLength: 12)
 
                 TransitionPreview(
-                    style: style, speed: speed, sensitivity: sensitivity, dockMovesWithSpace: dockMovesWithSpace
+                    style: style, speed: speed, sensitivity: sensitivity, dockMovesWithSpace: dockMovesWithSpace,
+                    isAnimating: isSelected || hover.isHovered
                 )
             }
             // The same space left of the text as right of the preview.
@@ -487,7 +506,13 @@ private struct TransitionRow: View {
             .contentShape(RoundedRectangle(cornerRadius: SettingsLayout.rowRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .onHover { hover.isHovered = $0 }
+        .onHover { hovered in
+            // The preview of this row starts to move now. The selected row already moves.
+            if hovered, !hover.isHovered, !isSelected {
+                PreviewClock.shared.restart()
+            }
+            hover.isHovered = hovered
+        }
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

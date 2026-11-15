@@ -66,16 +66,20 @@ final class TransitionController {
     /// It comes from the capture and not from the setting: the capture can fail to leave the Dock out.
     private var overlayIsBelowDock = false
 
+    /// Full images, for the spaces near the current one. A space is in `cache` or in `packed`, not in both.
     private var cache: [UInt64: Snapshot] = [:]
+    /// Compressed images, for the spaces that are too far away to show. See `Config.fullImageRadius`.
+    private var packed: [UInt64: PackedSnapshot] = [:]
+    /// Every space in `cache` or `packed`, oldest first.
     private var cacheOrder: [UInt64] = []
+    private var packing: Set<UInt64> = []
+    private var unpacking: Set<UInt64> = []
+    private static let packQueue = DispatchQueue(label: "com.cnrad.interspace.pack", qos: .utility)
+    private static let unpackQueue = DispatchQueue(label: "com.cnrad.interspace.unpack", qos: .userInteractive)
     private var wallpapers: [CGDirectDisplayID: Snapshot] = [:]
     /// Counts the changes of the displays, so a picture made for the displays before a change is not kept.
     private var wallpaperGeneration = 0
     private var knownSpaces: [String: [UInt64]] = [:]
-
-    /// Development only: makes the next check of the overlay window fail, to test its replacement.
-    enum WindowFault { case none, whenShown, atSwitch }
-    var debugWindowFault = WindowFault.none
 
     private var link: CADisplayLink?
     private var lastTick: CFTimeInterval = 0
@@ -106,10 +110,30 @@ final class TransitionController {
     private var dockLandedAfter = -1
     private var settleFrom: CGFloat = 0
 
+    // Frame timing of the swipe in progress, for the log. A long gap is a stutter the user saw.
+    /// Touch frames that moved the picture, and the longest time between two of them on the main thread.
+    private var dragFrames = 0
+    private var dragStart: CFTimeInterval = 0
+    private var dragLongestGap: CFTimeInterval = 0
+    /// Milliseconds from touch down to the first picture. -1 while there is none.
+    private var firstPictureAfter = -1
+    /// Display frames after the release, the longest time between two of them, and the frames that were lost.
+    private var snapFrames = 0
+    private var snapLongestGap: CFTimeInterval = 0
+    private var snapLostFrames = 0
+    private var snapFrameTime: CFTimeInterval = 0
+
     /// Space indexes still to visit, in order. The last one is the space the visit started on.
     /// A swipe in the Instant transition is in progress, and it has already switched (or cannot).
     private var instantSwipeActive = false
     private var instantSwipeFired = false
+    /// The space the Instant swipe started on, the direction of its first movement (+1 or -1),
+    /// and the number of spaces it has gone since, with a sign.
+    private var instantOrigin = 0
+    private var instantDirection = 0
+    private var instantSteps = 0
+    /// Keeps the Dock going to the space the swipe asked for, one step at a time, also after the fingers lift.
+    private var instantPump: Timer?
 
     private var tourRoute: [Int] = []
     private var tourToken = 0
@@ -145,8 +169,7 @@ final class TransitionController {
         wallpapers.removeAll()
         wallpaperGeneration += 1
         if phase == .idle {
-            cache.removeAll()
-            cacheOrder.removeAll()
+            forgetAllImages()
         }
         snapshotter.refreshDisplays()
         prepareWallpapers()
@@ -181,9 +204,15 @@ final class TransitionController {
 
     private func begin() {
         if isInstant, phase == .idle, !overlay.isVisible {
-            // Only the list of spaces is needed, to know if there is a space in that direction.
-            layout = currentLayout()
-            setBase(layout?.currentIndex ?? 0)
+            if instantPump == nil {
+                // Only the list of spaces is needed, to know if there is a space in that direction.
+                layout = currentLayout()
+                setBase(layout?.currentIndex ?? 0)
+            }
+            // If the Dock is still on its way from the swipe before, this one goes on from where that one ends.
+            instantOrigin = baseIndex
+            instantDirection = 0
+            instantSteps = 0
             instantSwipeActive = layout != nil
             instantSwipeFired = false
             return
@@ -193,8 +222,13 @@ final class TransitionController {
         lastFrameTime = now
         startWatchdog()
 
+        dragFrames = 0
+        dragStart = now
+        dragLongestGap = 0
+
         if overlay.isVisible {
             // Catch the transition in flight and continue from where it is.
+            logSnap()
             log.notice("begin: caught the overlay in phase \(String(describing: self.phase), privacy: .public) at progress \(self.progress)")
             stopLink()
             stabilityToken += 1
@@ -238,7 +272,9 @@ final class TransitionController {
         guard isEnabled, direction != 0 else { return }
 
         if isInstant {
-            guard phase == .idle, !overlay.isVisible, !instantSwipeActive, let layout = currentLayout() else { return }
+            guard phase == .idle, !overlay.isVisible, !instantSwipeActive, instantPump == nil,
+                  let layout = currentLayout()
+            else { return }
             self.layout = layout
             setBase(layout.currentIndex)
             _ = postSwitch(direction)
@@ -305,17 +341,16 @@ final class TransitionController {
 
     private func change(_ dx: CGFloat) {
         if instantSwipeActive {
-            // The first movement with a direction switches the space, at once and one time.
-            // The rest of the swipe does nothing, so it cannot be taken back.
-            let direction = Self.progress(forFingerTravel: dx)
-            if !instantSwipeFired, direction != 0 {
-                instantSwipeFired = true
-                _ = postSwitch(direction > 0 ? 1 : -1)
-            }
+            instantChange(Self.progress(forFingerTravel: dx))
             return
         }
         guard phase == .dragging, pendingRelease == nil else { return }
-        lastFrameTime = CACurrentMediaTime()
+        let now = CACurrentMediaTime()
+        // Trackpad reports come at a constant rate while the fingers are down, so a long gap here means
+        // the main thread was late, and the picture did not follow the fingers for that time.
+        dragLongestGap = max(dragLongestGap, now - lastFrameTime)
+        dragFrames += 1
+        lastFrameTime = now
         var raw = dragOrigin + Self.progress(forFingerTravel: dx)
 
         // With a high sensitivity one drag can pass several spaces. Each time the fingers have crossed a
@@ -342,9 +377,7 @@ final class TransitionController {
     private func end(velocity fingerVelocity: CGFloat, cancelled: Bool) {
         if instantSwipeActive {
             instantSwipeActive = false
-            if phase == .idle {
-                layout = nil
-            }
+            finishInstantIfDone()
             return
         }
         guard phase == .dragging, pendingRelease == nil else { return }
@@ -353,6 +386,11 @@ final class TransitionController {
         let releaseVelocity = Self.progress(forFingerTravel: fingerVelocity)
         let target = cancelled ? 0 : self.target(for: progress, velocity: releaseVelocity)
         log.notice("end: progress \(self.progress) velocity \(releaseVelocity) target \(target) overlay \(self.overlay.isVisible) captureFinished \(self.captureFinished) captureFailed \(self.captureFailed)")
+        if dragFrames > 0 {
+            let duration = Int((CACurrentMediaTime() - dragStart) * 1000)
+            let gap = String(format: "%.1f", dragLongestGap * 1000)
+            log.notice("drag: \(self.dragFrames) frames in \(duration) ms, longest gap \(gap, privacy: .public) ms, first picture \(self.firstPictureAfter) ms after touch down")
+        }
 
         if overlay.isVisible {
             commit(target: target, velocity: releaseVelocity)
@@ -366,6 +404,57 @@ final class TransitionController {
             // A very fast flick can end before the snapshot arrives. Run the animation when it does.
             pendingRelease = (target, releaseVelocity)
             switchWithoutOverlayIfLate()
+        }
+    }
+
+    // MARK: - Instant
+
+    /// How far the fingers must come back past a step before that step is undone, in spaces.
+    /// Without it, fingers that rest on the line between two steps would switch back and forth.
+    private static let instantBackMargin: CGFloat = 0.15
+
+    /// `travel` is how far the fingers have moved since the swipe started, in spaces, with the swipe
+    /// sensitivity in it. The first movement switches one space at once. After that, each further whole
+    /// space of travel switches one more, as a scroll does, and travel back undoes them.
+    /// At normal sensitivity a full trackpad width is under one space, so one swipe is one space.
+    private func instantChange(_ travel: CGFloat) {
+        guard let layout else { return }
+        if !instantSwipeFired {
+            guard travel != 0 else { return }
+            instantSwipeFired = true
+            instantDirection = travel > 0 ? 1 : -1
+        }
+        // In the direction of the first movement. The first step is there at no travel at all.
+        let forward = travel * CGFloat(instantDirection) + 1
+        var steps = instantSteps * instantDirection
+        while forward >= CGFloat(steps + 1) { steps += 1 }
+        while forward < CGFloat(steps) - Self.instantBackMargin { steps -= 1 }
+
+        let wanted = min(max(instantOrigin + steps * instantDirection, 0), layout.spaceIDs.count - 1)
+        // At the first or the last space the count stops too, so the way back starts at once.
+        instantSteps = wanted - instantOrigin
+        guard wanted != baseIndex else { return }
+        baseIndex = wanted
+        pumpDock()
+        if instantPump == nil, dockIndex != baseIndex {
+            // The Dock takes one step at a time. This sends the next one when the step before is done.
+            let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.pumpDock()
+                self.finishInstantIfDone()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            instantPump = timer
+        }
+    }
+
+    /// Ends the Instant swipe when the fingers are up and the Dock is where the swipe asked.
+    private func finishInstantIfDone() {
+        guard !instantSwipeActive, dockIndex == baseIndex || layout == nil else { return }
+        instantPump?.invalidate()
+        instantPump = nil
+        if phase == .idle, !overlay.isVisible {
+            layout = nil
         }
     }
 
@@ -394,6 +483,8 @@ final class TransitionController {
     }
 
     private func commit(target: Int, velocity releaseVelocity: CGFloat) {
+        // A press of the shortcut during a snap starts the next one here.
+        logSnap()
         if target != 0 {
             retarget(by: target)
         }
@@ -433,6 +524,7 @@ final class TransitionController {
         let steps = destination - baseIndex
         guard steps != 0 else { return }
         baseIndex = destination
+        unpackNearImages()
         // There is a picture for `limit` spaces to each side. More than that is rare, and the picture jumps.
         progress = min(max(progress - CGFloat(steps), -limit), limit)
         didSwitch = true
@@ -473,6 +565,7 @@ final class TransitionController {
         let moved = baseIndex - actual
         setBase(actual)
         guard moved != 0 else { return }
+        unpackNearImages()
         progress = min(max(progress + CGFloat(moved), -limit), limit)
         if overlay.isVisible {
             CATransaction.begin()
@@ -499,12 +592,7 @@ final class TransitionController {
             log.notice("the list of spaces changed during a gesture, no switch")
             return false
         }
-        var required = layout.desktopIDs
-        if debugWindowFault == .atSwitch {
-            debugWindowFault = .none
-            required.append(.max)
-        }
-        if overlay.ensureOnAllDesktops(required) {
+        if overlay.ensureOnAllDesktops(layout.desktopIDs) {
             log.notice("replaced the overlay window at the switch: it was not on every desktop")
         }
         guard ds_post_switch(target > 0 ? DSDirectionRight : DSDirectionLeft) else { return false }
@@ -525,6 +613,8 @@ final class TransitionController {
         layout = currentLayout()
         guard let layout else { return }
         setBase(layout.currentIndex)
+        unpackNearImages()
+        firstPictureAfter = -1
         captureStarted = CACurrentMediaTime()
 
         let token = captureToken
@@ -575,6 +665,7 @@ final class TransitionController {
         let removed = Set(before).subtracting(layout.spaceIDs)
         for spaceID in removed {
             cache[spaceID] = nil
+            packed[spaceID] = nil
         }
         cacheOrder.removeAll { removed.contains($0) }
         log.notice("spaces changed: \(before.count) to \(layout.spaceIDs.count), \(removed.count) removed")
@@ -582,17 +673,101 @@ final class TransitionController {
 
     private func store(_ snapshot: Snapshot, for spaceID: UInt64) {
         cache[spaceID] = snapshot
+        // The new image replaces the old one in each form.
+        packed[spaceID] = nil
         cacheOrder.removeAll { $0 == spaceID }
         cacheOrder.append(spaceID)
         while cacheOrder.count > Config.snapshotCacheLimit {
-            cache[cacheOrder.removeFirst()] = nil
+            let oldest = cacheOrder.removeFirst()
+            cache[oldest] = nil
+            packed[oldest] = nil
+        }
+    }
+
+    private func forgetAllImages() {
+        cache.removeAll()
+        packed.removeAll()
+        cacheOrder.removeAll()
+    }
+
+    /// The kind of image we have of a space: with the Dock in it, or without. Nil when we have none.
+    private func imageIncludesDock(_ spaceID: UInt64) -> Bool? {
+        cache[spaceID]?.includesDock ?? packed[spaceID]?.includesDock
+    }
+
+    // MARK: - Memory
+
+    /// Compresses the images of the spaces that are far from the current one, a moment after a transition,
+    /// when nothing moves. A new swipe cancels it.
+    private func packFarImages(_ token: Int) {
+        guard cache.count > 2 * Config.fullImageRadius + 1 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, token == self.refreshToken, self.phase == .idle, !self.overlay.isVisible else { return }
+            for screen in NSScreen.screens {
+                guard let layout = Spaces.layout(for: screen) else { continue }
+                for (index, spaceID) in layout.spaceIDs.enumerated()
+                where abs(index - layout.currentIndex) > Config.fullImageRadius {
+                    guard let snapshot = self.cache[spaceID], !self.packing.contains(spaceID) else { continue }
+                    self.packing.insert(spaceID)
+                    Self.packQueue.async {
+                        let stored = PackedSnapshot(snapshot)
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            self.packing.remove(spaceID)
+                            // Not when the space has a newer image now, and not in a transition: the
+                            // space can be near by now, and a card can need the image in this frame.
+                            guard let stored, self.phase == .idle, self.cache[spaceID]?.image === snapshot.image else { return }
+                            self.cache[spaceID] = nil
+                            self.packed[spaceID] = stored
+                            log.info("packed the image of space \(spaceID): \(stored.fullByteCount / 1_000_000) MB to \(stored.byteCount / 1_000_000) MB")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Makes full images again for the spaces that are near the base now, off the main thread.
+    /// It runs one step before such a space can show, so the image is there when a card needs it.
+    private func unpackNearImages() {
+        guard let layout, !packed.isEmpty else { return }
+        for (index, spaceID) in layout.spaceIDs.enumerated() where abs(index - baseIndex) <= Config.fullImageRadius {
+            guard let stored = packed[spaceID], !unpacking.contains(spaceID) else { continue }
+            unpacking.insert(spaceID)
+            Self.unpackQueue.async {
+                let snapshot = stored.unpacked()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.unpacking.remove(spaceID)
+                    // The space has a newer image now, or `content(at:)` could not wait for this one.
+                    guard let current = self.packed[spaceID], current.isSame(as: stored) else { return }
+                    self.packed[spaceID] = nil
+                    if let snapshot {
+                        self.cache[spaceID] = snapshot
+                    } else {
+                        self.cacheOrder.removeAll { $0 == spaceID }
+                    }
+                }
+            }
         }
     }
 
     private func content(at index: Int) -> CardContent {
         guard let layout, layout.spaceIDs.indices.contains(index) else { return .none }
-        if let snapshot = cache[layout.spaceIDs[index]] {
+        let spaceID = layout.spaceIDs[index]
+        if let snapshot = cache[spaceID] {
             return .snapshot(snapshot)
+        }
+        if let stored = packed[spaceID] {
+            // `unpackNearImages` has not finished this one. A card needs it now, so the main thread makes it.
+            let started = CACurrentMediaTime()
+            packed[spaceID] = nil
+            if let snapshot = stored.unpacked() {
+                cache[spaceID] = snapshot
+                log.notice("unpacked an image in the transition: \(Int((CACurrentMediaTime() - started) * 1000)) ms on the main thread")
+                return .snapshot(snapshot)
+            }
+            cacheOrder.removeAll { $0 == spaceID }
         }
         let displayID = layout.displayID
         if wallpapers[displayID] == nil {
@@ -606,12 +781,7 @@ final class TransitionController {
 
     private func present() {
         guard let layout else { return }
-        var required = layout.desktopIDs
-        if debugWindowFault == .whenShown {
-            debugWindowFault = .none
-            required.append(.max)
-        }
-        if overlay.ensureOnAllDesktops(required) {
+        if overlay.ensureOnAllDesktops(layout.desktopIDs) {
             log.notice("replaced the overlay window before it was shown: it was not on every desktop")
         }
         overlay.isBelowDock = overlayIsBelowDock
@@ -623,6 +793,9 @@ final class TransitionController {
         overlay.render(progress: progress)
         CATransaction.commit()
         overlay.present()
+        if firstPictureAfter < 0 {
+            firstPictureAfter = Int((CACurrentMediaTime() - captureStarted) * 1000)
+        }
     }
 
     private func assignCards() {
@@ -676,6 +849,16 @@ final class TransitionController {
     @objc private func tick(_ link: CADisplayLink) {
         let now = link.timestamp
         let delta = lastTick == 0 ? link.duration : min(now - lastTick, 1.0 / 30)
+        if lastTick != 0 {
+            let gap = now - lastTick
+            snapLongestGap = max(snapLongestGap, gap)
+            // One and a half frame times or more between two frames: at least one frame was lost.
+            if gap > link.duration * 1.5 {
+                snapLostFrames += Int((gap / link.duration).rounded()) - 1
+            }
+        }
+        snapFrames += 1
+        snapFrameTime = link.duration
         lastTick = now
 
         if phase == .settling || phase == .holding || phase == .revealing {
@@ -736,6 +919,17 @@ final class TransitionController {
 
     private var isSettled: Bool {
         TransitionMath.isSettled(progress: progress, velocity: velocity)
+    }
+
+    /// Writes the frame timing of the snap that ends now, or that a new swipe or key press takes over.
+    private func logSnap() {
+        guard snapFrames > 0 else { return }
+        let gap = String(format: "%.1f", snapLongestGap * 1000)
+        let frameTime = String(format: "%.1f", snapFrameTime * 1000)
+        log.notice("snap: \(self.snapFrames) frames, longest gap \(gap, privacy: .public) ms, lost \(self.snapLostFrames), frame time \(frameTime, privacy: .public) ms")
+        snapFrames = 0
+        snapLongestGap = 0
+        snapLostFrames = 0
     }
 
     /// Starts to look at the live desktop below the overlay near the end of the snap.
@@ -836,14 +1030,13 @@ final class TransitionController {
         else { return }
 
         if again {
-            cache.removeAll()
-            cacheOrder.removeAll()
+            forgetAllImages()
         }
         let origin = layout.currentIndex
         let includeDock = AppSettings.shared.dockMovesWithSpace
         // An image of the other kind (with the Dock, or without it) is as good as no image.
         let unknown = layout.spaceIDs.indices.filter {
-            $0 != origin && cache[layout.spaceIDs[$0]]?.includesDock != includeDock
+            $0 != origin && imageIncludesDock(layout.spaceIDs[$0]) != includeDock
         }
         guard let lowest = unknown.min(), let highest = unknown.max() else { return }
 
@@ -939,33 +1132,6 @@ final class TransitionController {
         overlay.present()
     }
 
-    /// Development only: shows the cover for `hold` seconds with no space switch below it, then fades it out.
-    func debugCoverTest(hold: Double) {
-        guard isEnabled, phase == .idle, !overlay.isVisible, let layout = currentLayout() else { return }
-        self.layout = layout
-        setBase(layout.currentIndex)
-        progress = 0
-        velocity = 0
-        phase = .touring
-        tourToken += 1
-        let token = tourToken
-        snapshotter.capture(screen: layout.screen, includeDock: true) { [weak self] snapshot in
-            guard let self, self.isTouring(token), let snapshot else { return }
-            self.presentCover(snapshot)
-            DispatchQueue.main.asyncAfter(deadline: .now() + hold) { [weak self] in
-                guard let self, self.isTouring(token) else { return }
-                self.tourToken += 1
-                self.didSwitch = false
-                self.stabilityStarted = false
-                self.liveReady = false
-                self.settleStart = CACurrentMediaTime()
-                self.phase = .holding
-                self.phaseStart = CACurrentMediaTime()
-                self.startLink()
-            }
-        }
-    }
-
     private func isTouring(_ token: Int) -> Bool {
         phase == .touring && token == tourToken
     }
@@ -984,7 +1150,7 @@ final class TransitionController {
         baseIndex = index
         let spaceID = layout.spaceIDs[index]
         let includesDock = tourIncludesDock
-        let needsCapture = cache[spaceID]?.includesDock != includesDock
+        let needsCapture = imageIncludesDock(spaceID) != includesDock
 
         // Never post the next swipe before the Dock has finished this one.
         waitForDock(token, deadline: CACurrentMediaTime() + 1.0) { [weak self] in
@@ -1045,7 +1211,7 @@ final class TransitionController {
         } else {
             setBase(baseIndex)
         }
-        log.notice("visit end: on index \(self.baseIndex), \(self.cache.count) spaces captured")
+        log.notice("visit end: on index \(self.baseIndex), \(self.cacheOrder.count) spaces captured")
         // The cover stays as it is, a picture of the desktop the visit started on.
         didSwitch = true
         stabilityStarted = false
@@ -1077,6 +1243,8 @@ final class TransitionController {
         if switched, Config.refreshAfterSwitch, isEnabled {
             refreshCurrentSpace(refreshToken)
         }
+        packFarImages(refreshToken)
+        logSnap()
         phase = .idle
         layout = nil
         progress = 0
@@ -1117,6 +1285,8 @@ final class TransitionController {
     /// Stops everything now, for example when the app is disabled in the middle of a swipe.
     private func abort() {
         instantSwipeActive = false
+        instantPump?.invalidate()
+        instantPump = nil
         captureToken += 1
         recognizer.reset()
         reset()

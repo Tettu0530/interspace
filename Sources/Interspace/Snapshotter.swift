@@ -15,6 +15,73 @@ struct Snapshot {
 
 }
 
+/// A snapshot that uses less memory: the same pixels, compressed with no loss. Use from any thread.
+///
+/// A full-screen image is about 34 MB on a 3600 x 2364 display. The app keeps one for each space, and it
+/// draws only the spaces near the current one. The others wait in this form.
+struct PackedSnapshot {
+    private let data: NSData
+    private let width: Int
+    private let height: Int
+    private let bitsPerComponent: Int
+    private let bitsPerPixel: Int
+    private let bytesPerRow: Int
+    private let colorSpace: CGColorSpace
+    private let bitmapInfo: CGBitmapInfo
+    private let shouldInterpolate: Bool
+    private let intent: CGColorRenderingIntent
+    private let patch: CGImage?
+    private let patchFrame: CGRect
+    let includesDock: Bool
+
+    /// Bytes in memory, and bytes of the image this was made from.
+    var byteCount: Int { data.length }
+    var fullByteCount: Int { bytesPerRow * height }
+
+    /// Nil when the pixels cannot be read, or when the result is not much smaller.
+    init?(_ snapshot: Snapshot) {
+        let image = snapshot.image
+        guard let colorSpace = image.colorSpace,
+              let pixels = image.dataProvider?.data as NSData?,
+              pixels.length >= image.bytesPerRow * image.height,
+              let compressed = try? pixels.compressed(using: .lz4),
+              compressed.length * 4 < pixels.length * 3
+        else { return nil }
+        data = compressed
+        width = image.width
+        height = image.height
+        bitsPerComponent = image.bitsPerComponent
+        bitsPerPixel = image.bitsPerPixel
+        bytesPerRow = image.bytesPerRow
+        self.colorSpace = colorSpace
+        bitmapInfo = image.bitmapInfo
+        shouldInterpolate = image.shouldInterpolate
+        intent = image.renderingIntent
+        patch = snapshot.patch
+        patchFrame = snapshot.patchFrame
+        includesDock = snapshot.includesDock
+    }
+
+    /// The snapshot this was made from, with the same pixels. About 15 ms for a full-screen image.
+    func unpacked() -> Snapshot? {
+        guard let pixels = try? data.decompressed(using: .lz4),
+              pixels.length >= bytesPerRow * height,
+              let provider = CGDataProvider(data: pixels),
+              let image = CGImage(
+                  width: width, height: height, bitsPerComponent: bitsPerComponent, bitsPerPixel: bitsPerPixel,
+                  bytesPerRow: bytesPerRow, space: colorSpace, bitmapInfo: bitmapInfo, provider: provider,
+                  decode: nil, shouldInterpolate: shouldInterpolate, intent: intent
+              )
+        else { return nil }
+        return Snapshot(image: image, patch: patch, patchFrame: patchFrame, includesDock: includesDock)
+    }
+
+    /// True when both are the same stored data, not only equal data.
+    func isSame(as other: PackedSnapshot) -> Bool {
+        data === other.data
+    }
+}
+
 /// Captures displays with ScreenCaptureKit. Use from the main thread.
 ///
 /// Two captures run at the same time, because no single one gives the right image:
@@ -158,12 +225,29 @@ final class Snapshotter {
             x: islandFrame.minX * scale, y: islandFrame.minY * scale,
             width: islandFrame.width * scale, height: islandFrame.height * scale
         ).integral
-        guard let patch = filtered.cropping(to: pixels) else { return }
-        snapshot.patch = patch
+        guard let crop = filtered.cropping(to: pixels) else { return }
+        // A cropped image keeps the whole image it was cut from in memory: one more full screen for each
+        // snapshot. The copy has only its own pixels.
+        snapshot.patch = Self.copy(of: crop) ?? crop
         snapshot.patchFrame = CGRect(
             x: pixels.minX / scale, y: pixels.minY / scale,
             width: pixels.width / scale, height: pixels.height / scale
         )
+    }
+
+    /// The same pixels in memory of their own.
+    private static func copy(of image: CGImage) -> CGImage? {
+        guard let colorSpace = image.colorSpace, colorSpace.model == .rgb, image.bitsPerComponent == 8,
+              let context = CGContext(
+                  data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+              )
+        else { return nil }
+        context.interpolationQuality = .none
+        context.setBlendMode(.copy)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage()
     }
 
     // MARK: - Capture below the overlay

@@ -12,6 +12,24 @@ import SwiftUI
 /// - Hexagon: the display is fixed here too, as the spaces turn in front of it.
 /// - Magnetic: the display is fixed, because each space has its own size that depends on where it is.
 /// - Stack: the display is fixed on the pile, and a second pile beside it is the spaces that wait.
+/// The time all previews count from, and if the settings window can be seen.
+///
+/// The previews that move use one clock, so they start their moves together. The clock starts again when
+/// one more preview starts to move: that one then starts from rest, with no jump, and the others start
+/// with it, so the two can be compared.
+final class PreviewClock: ObservableObject {
+    static let shared = PreviewClock()
+
+    /// Seconds on the clock of `Date.timeIntervalSinceReferenceDate`.
+    @Published private(set) var start = Date().timeIntervalSinceReferenceDate
+    /// False when the window is covered, on another space, or closed. Nothing moves then.
+    @Published var isWindowVisible = true
+
+    func restart() {
+        start = Date().timeIntervalSinceReferenceDate
+    }
+}
+
 struct TransitionPreview: View {
     let style: TransitionStyle
     /// The speed setting. It changes the custom transitions only.
@@ -24,7 +42,13 @@ struct TransitionPreview: View {
     /// Development only: draws this moment of the loop and does not move.
     static var fixedTime: Double?
 
+    /// False: the preview is at rest on space 1 and draws nothing new. A preview that moves is drawn again
+    /// for each frame of the display, so only the ones the user looks at move: the selected one, and the
+    /// one below the pointer.
+    var isAnimating = true
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var clock = PreviewClock.shared
 
     /// Every transition gets the same time slot for one move and its pause, so all previews start
     /// their moves together and the faster one visibly arrives first.
@@ -36,10 +60,19 @@ struct TransitionPreview: View {
     static let size = CGSize(width: 188, height: 56)
 
     var body: some View {
-        TimelineView(.animation(paused: reduceMotion || Self.fixedTime != nil)) { timeline in
+        let moves = isAnimating && clock.isWindowVisible && !reduceMotion && Self.fixedTime == nil
+        TimelineView(.animation(paused: !moves)) { timeline in
             Canvas { context, size in
-                let time = Self.fixedTime ?? timeline.date.timeIntervalSinceReferenceDate
-                let position = reduceMotion ? 0 : position(at: time)
+                let position: Double
+                if reduceMotion {
+                    position = 0
+                } else if let fixedTime = Self.fixedTime {
+                    position = self.position(at: fixedTime)
+                } else if moves {
+                    position = self.position(at: max(timeline.date.timeIntervalSinceReferenceDate - clock.start, 0))
+                } else {
+                    position = 0
+                }
                 switch style {
                 case .system, .lightweight, .instant: drawSlide(in: &context, size: size, position: position)
                 case .hexagon: drawHexagon(in: &context, size: size, position: position)

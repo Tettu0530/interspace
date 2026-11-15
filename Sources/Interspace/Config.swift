@@ -92,6 +92,10 @@ enum Config {
     static let refreshAfterSwitch = true
     /// Number of space snapshots kept in memory.
     static let snapshotCacheLimit = 16
+    /// Spaces further than this from the current one keep their image compressed, with no loss of pixels.
+    /// An image is made full again when its space comes this near, one step before it can show.
+    /// So this must be more than `Overlay.reach`.
+    static let fullImageRadius = 3
     /// At launch, visit every space one time behind a frozen image of the screen and capture it,
     /// so the first swipe to a space already shows its real content.
     static let captureSpacesAtLaunch = true

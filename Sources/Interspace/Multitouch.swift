@@ -14,7 +14,6 @@ final class MultitouchMonitor {
 
     /// Called on the main thread. Only frames with 3+ fingers, plus the first frame after, are delivered.
     var onFrame: ((TouchFrame) -> Void)?
-    var debugLogging = false
 
     private typealias DeviceRef = UnsafeMutableRawPointer
     fileprivate typealias ContactCallback = @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
@@ -112,11 +111,6 @@ private let contactCallback: MultitouchMonitor.ContactCallback = { device, touch
             let y = touch.load(fromByteOffset: yOffset, as: Float.self)
             points.append(CGPoint(x: CGFloat(x), y: CGFloat(y)))
         }
-    }
-
-    if monitor.debugLogging, count > 0 {
-        let list = points.map { String(format: "(%.3f, %.3f)", $0.x, $0.y) }.joined(separator: " ")
-        print("touches raw=\(count) active=\(points.count) \(list)")
     }
 
     // Normal one and two finger use never reaches the main thread.

@@ -69,6 +69,9 @@ END = re.compile(r"end: progress (-?[\d.e-]+) velocity (-?[\d.e-]+) target (-?\d
 FADE = re.compile(r"(fade|cut) starts (-?\d+) ms after release, from (-?[\d.e-]+); Dock showed the new space after (-?\d+) ms")
 CAUGHT = re.compile(r"begin: caught the overlay in phase (\w+) at progress (-?[\d.e-]+)")
 KEY_IN = re.compile(r"key: direction (-?\d+) in phase (\w+)")
+DRAG = re.compile(r"drag: (\d+) frames in (-?\d+) ms, longest gap ([\d.]+) ms, first picture (-?\d+) ms after touch down")
+SNAP = re.compile(r"snap: (\d+) frames, longest gap ([\d.]+) ms, lost (\d+), frame time ([\d.]+) ms")
+SLOW_UNPACK = re.compile(r"unpacked an image in the transition: (\d+) ms")
 VISIT_START = re.compile(r"visit start: (\d+) spaces, on index (\d+), route \[(.*)\]")
 
 ends, fades = [], []
@@ -85,7 +88,26 @@ visit_open = {}
 switch_times = []          # (time, pid, target) of committed switches
 refreshes = 0
 
+drag_gaps, first_pictures, snap_gaps, snap_lost, snap_frames, slow_unpacks = [], [], [], [], [], []
+
 for t, pid, cat, msg in events:
+    m = DRAG.match(msg)
+    if m:
+        drag_gaps.append(float(m.group(3)))
+        if int(m.group(4)) >= 0:
+            first_pictures.append(int(m.group(4)))
+        continue
+    m = SNAP.match(msg)
+    if m:
+        snap_frames.append(int(m.group(1)))
+        # In frame times, so displays of 60 Hz and 120 Hz compare.
+        snap_gaps.append(float(m.group(2)) / max(float(m.group(4)), 0.1))
+        snap_lost.append(int(m.group(3)))
+        continue
+    m = SLOW_UNPACK.match(msg)
+    if m:
+        slow_unpacks.append(int(m.group(1)))
+        continue
     m = END.match(msg)
     if m:
         progress, velocity, target = float(m.group(1)), float(m.group(2)), int(m.group(3))
@@ -237,6 +259,20 @@ rows = [l for l in launches.values() if "first_log" in l]
 describe("first log line to 'active'", [(l["active"] - l["first_log"]) * 1000 for l in rows if "active" in l])
 describe("first log line to visit start", [(l["visit_start"] - l["first_log"]) * 1000 for l in rows if "visit_start" in l])
 describe("first log line to all spaces captured", [(l["visit_end"] - l["first_log"]) * 1000 for l in rows if "visit_end" in l])
+
+print("\n== Stutter (frame timing in the app's own process) ==")
+if drag_gaps or snap_gaps:
+    describe("drag: longest time between two touch frames, per swipe", drag_gaps)
+    late = sum(1 for v in drag_gaps if v > 25)
+    print(f"    swipes with a gap over 25 ms under the fingers: {late} of {len(drag_gaps)}")
+    describe("touch down to the first picture", first_pictures)
+    describe("snap: longest time between two frames, per snap", snap_gaps, unit="frame times")
+    with_loss = sum(1 for v in snap_lost if v > 0)
+    print(f"    snaps that lost a frame: {with_loss} of {len(snap_lost)}   frames lost: {sum(snap_lost)} of {sum(snap_frames)}")
+    print(f"    images unpacked on the main thread in a transition: {len(slow_unpacks)}"
+          + (f" (longest {max(slow_unpacks)} ms)" if slow_unpacks else ""))
+else:
+    print("  no 'drag:' or 'snap:' lines: this build of the app does not write them yet")
 
 print("\n== Fault lines ==")
 if problems:
